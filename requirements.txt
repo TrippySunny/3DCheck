@@ -1,0 +1,6 @@
+trimesh>=4.4
+numpy>=1.26
+scipy>=1.11
+networkx>=3.2
+rtree>=1.2
+customtkinter>=5.2
