@@ -125,6 +125,11 @@ class MeshViewer(OpenGLFrame):
         self._pan[:] = 0.0
         self.refresh()
 
+    def set_view(self, yaw: float, pitch: float) -> None:
+        self._yaw = float(yaw)
+        self._pitch = float(np.clip(pitch, -89.9, 89.9))
+        self.refresh()
+
     def set_layer(self, key: str, state: bool) -> None:
         self.visible[key] = bool(state)
         if key in FACE_LAYERS:

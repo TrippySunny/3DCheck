@@ -35,6 +35,9 @@ def run(app: Application, queue: list[Path]) -> None:
     def finish(report: AnalysisReport) -> None:
         app.viewer.set_wireframe(False)
         shot = app.viewer.save_screenshot(OUTPUT / f"{target.stem}.png")
+        app.viewer.set_view(210.0, -20.0)
+        app.viewer.save_screenshot(OUTPUT / f"{target.stem}_back.png")
+        app.viewer.set_view(30.0, -20.0)
         app.viewer.set_wireframe(True)
         app.viewer.save_screenshot(OUTPUT / f"{target.stem}_wire.png")
         app.viewer.set_wireframe(False)

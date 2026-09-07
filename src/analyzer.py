@@ -59,9 +59,10 @@ class MeshAnalyzer:
         ".3mf",
         ".dae",
     )
-    SPLIT_VERTEX_FORMATS: tuple[str, ...] = (".stl",)
+    TOPOLOGY_FORMATS: tuple[str, ...] = (".obj", ".ply", ".off")
     POLYGON_BUDGET: int = 100_000
     FACET_FACE_LIMIT: int = 400_000
+    MARK_MIN_EXCESS: int = 2
     HOTSPOT_MIN_VERTICES: int = 6
     GRADES: tuple[tuple[float, str], ...] = (
         (90.0, "Отличная оптимизация"),
@@ -75,8 +76,10 @@ class MeshAnalyzer:
         self.path: Path = Path(path).expanduser().resolve()
         self.polygon_budget: int = int(polygon_budget or self.POLYGON_BUDGET)
         self.raw: trimesh.Trimesh = self._load()
+        self.shaded: trimesh.Trimesh = self.raw.copy()
+        self.shaded.merge_vertices()
         self.welded: trimesh.Trimesh = self.raw.copy()
-        self.welded.merge_vertices()
+        self.welded.merge_vertices(merge_tex=True, merge_norm=True)
         self.scale: float = float(self.raw.scale) if self.raw.scale > 0 else 1.0
         self.weld_tolerance: float = max(self.scale * 1e-6, 1e-9)
         self.cluster_radius: float = self.scale * 1e-3
@@ -119,6 +122,7 @@ class MeshAnalyzer:
             "size_mb": round(self.path.stat().st_size / 1024 / 1024, 2),
             "faces": int(len(self.raw.faces)),
             "vertices": int(len(self.raw.vertices)),
+            "shaded_vertices": int(len(self.shaded.vertices)),
             "welded_vertices": int(len(self.welded.vertices)),
             "bodies": int(self.welded.body_count),
             "dimensions": [round(float(value), 4) for value in self.raw.extents],
@@ -197,7 +201,7 @@ class MeshAnalyzer:
         flipped_ids = np.flatnonzero(dots < 0.0)
         flipped = int(flipped_ids.size)
         flipped_ratio = flipped / len(mesh.faces) if len(mesh.faces) else 0.0
-        inverted = bool(watertight and float(mesh.volume) < 0.0)
+        inverted = bool(watertight and winding_consistent and float(mesh.volume) < 0.0)
 
         penalty = min(30.0, flipped_ratio * 70.0)
         if not winding_consistent:
@@ -257,16 +261,24 @@ class MeshAnalyzer:
     def check_vertices(self) -> CheckResult:
         vertices = np.asarray(self.raw.vertices, dtype=np.float64)
         total = int(len(vertices))
-        split_by_format = self.path.suffix.lower() in self.SPLIT_VERTEX_FORMATS
-        duplicate_groups = self._cluster(vertices, self.weld_tolerance, 2)
-        duplicated = int(sum(len(group) - 1 for group in duplicate_groups))
+        distinct = int(len(self.welded.vertices))
+        declared = self._declared_vertex_count()
+        split_by_format = declared is None
+        groups = self._cluster(vertices, self.weld_tolerance, 2)
+        duplicated = (
+            int(sum(len(group) - 1 for group in groups))
+            if declared is None
+            else max(declared - distinct, 0)
+        )
+        duplicate_groups = groups if duplicated else []
         largest_duplicate = int(max((len(group) for group in duplicate_groups), default=0))
         welded_vertices = np.asarray(self.welded.vertices, dtype=np.float64)
         hotspots = self._hotspots(welded_vertices)
         largest_hotspot = int(max((len(group) for group in hotspots), default=0))
         stray_ids = np.setdiff1d(np.arange(total), np.unique(self.raw.faces))
         stray = int(stray_ids.size)
-        duplicate_ratio = duplicated / total if total else 0.0
+        reference = declared if declared else total
+        duplicate_ratio = duplicated / reference if reference else 0.0
 
         penalty = 0.0
         if not split_by_format:
@@ -279,15 +291,24 @@ class MeshAnalyzer:
             penalty += min(6.0, 2.0 + stray / total * 40.0)
 
         hints: list[str] = []
-        if split_by_format:
+        if split_by_format and duplicated:
+            keeps = ", ".join(self.TOPOLOGY_FORMATS)
             hints.append(
-                f"Формат {self.path.suffix.lower()} хранит вершины отдельно для каждого треугольника, "
-                f"поэтому {duplicated} совпадений — особенность контейнера, а не дефект модели"
+                f"Формат {self.path.suffix.lower()} разрезает вершины по нормалям и UV, поэтому "
+                f"{duplicated} совпадений — особенность контейнера, а не дефект модели. "
+                f"Чтобы проверить сварку вершин, экспортируйте в {keeps}"
+            )
+        elif duplicated and not duplicate_groups:
+            hints.append(
+                f"Merge by Distance убрал бы {duplicated} вершин "
+                "(M → By Distance в режиме редактирования)"
             )
         elif duplicated:
+            places = len(duplicate_groups)
             hints.append(
-                f"Дублирующихся вершин: {duplicated} в {len(duplicate_groups)} точках "
-                f"(максимум {largest_duplicate} в одной). Blender → Merge by Distance (M → By Distance)"
+                f"Дублирующихся вершин: {duplicated} в {places} "
+                f"{'точке' if places == 1 else 'точках'} (максимум {largest_duplicate} в одной). "
+                "Blender → Merge by Distance (M → By Distance)"
             )
         if hotspots:
             hints.append(
@@ -343,12 +364,75 @@ class MeshAnalyzer:
         marked: list[np.ndarray] = []
         for facet, boundary in zip(mesh.facets, mesh.facets_boundary):
             used = int(len(facet))
-            outline = int(len(np.unique(boundary)))
-            minimal = max(outline - 2, 1)
-            if used > minimal:
-                total += used - minimal
+            minimal = max(self._boundary_corners(boundary) - 2, 1)
+            excess = used - minimal
+            if excess > 0:
+                total += excess
+            if excess >= self.MARK_MIN_EXCESS:
                 marked.append(np.asarray(facet, dtype=np.int64))
         return total, np.concatenate(marked) if marked else empty
+
+    def _declared_vertex_count(self) -> int | None:
+        suffix = self.path.suffix.lower()
+        if suffix not in self.TOPOLOGY_FORMATS:
+            return None
+        try:
+            if suffix == ".obj":
+                total = 0
+                with self.path.open("r", encoding="utf-8", errors="ignore") as handle:
+                    for line in handle:
+                        if line[:2] in ("v ", "v\t"):
+                            total += 1
+                return total
+            if suffix == ".ply":
+                with self.path.open("rb") as handle:
+                    for chunk in handle:
+                        line = chunk.decode("ascii", errors="ignore").strip()
+                        if line.startswith("element vertex"):
+                            return int(line.split()[2])
+                        if line == "end_header":
+                            break
+                return None
+            if suffix == ".off":
+                with self.path.open("r", encoding="utf-8", errors="ignore") as handle:
+                    first = handle.readline().strip()
+                    counts = first[3:].strip() if first.upper().startswith("OFF") else first
+                    while not counts:
+                        counts = handle.readline().strip()
+                    return int(counts.split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+        return None
+
+    def _boundary_corners(self, boundary: np.ndarray) -> int:
+        edges = np.asarray(boundary, dtype=np.int64).reshape(-1, 2)
+        if edges.size == 0:
+            return 0
+        endpoints = edges.reshape(-1)
+        partners = edges[:, ::-1].reshape(-1)
+        order = np.argsort(endpoints, kind="stable")
+        unique, starts, counts = np.unique(
+            endpoints[order], return_index=True, return_counts=True
+        )
+        paired = counts == 2
+        if not np.any(paired):
+            return int(unique.size)
+        sorted_partners = partners[order]
+        vertices = self.welded.vertices
+        origin = vertices[unique[paired]]
+        first = vertices[sorted_partners[starts[paired]]] - origin
+        second = vertices[sorted_partners[starts[paired] + 1]] - origin
+        first_norm = np.linalg.norm(first, axis=1)
+        second_norm = np.linalg.norm(second, axis=1)
+        usable = (first_norm > 1e-12) & (second_norm > 1e-12)
+        cosine = np.zeros(len(origin))
+        cosine[usable] = np.einsum(
+            "ij,ij->i",
+            first[usable] / first_norm[usable, None],
+            second[usable] / second_norm[usable, None],
+        )
+        collinear = usable & (np.abs(cosine + 1.0) <= 1e-4)
+        return int(unique.size - np.count_nonzero(collinear))
 
     def _cluster(self, points: np.ndarray, radius: float, min_size: int) -> list[np.ndarray]:
         if len(points) < min_size or radius <= 0.0:
