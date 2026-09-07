@@ -17,7 +17,8 @@ except ModuleNotFoundError:
     from src.analyzer import CRITICAL, OK, WARNING, AnalysisReport, MeshAnalyzer
     from src.viewer import LAYER_COLORS, LAYER_ORDER, LAYER_TITLES, MeshViewer
 
-ASSETS = Path(__file__).resolve().parents[1] / "assets"
+BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+ASSETS = BASE / "assets"
 SEVERITY_COLORS = {OK: "#41b06e", WARNING: "#e0a112", CRITICAL: "#e0453e"}
 SEVERITY_TITLES = {OK: "норма", WARNING: "предупреждение", CRITICAL: "критично"}
 FILE_TYPES = [

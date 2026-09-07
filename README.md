@@ -15,7 +15,7 @@ pip install -r requirements.txt
 
 ## Запуск
 
-Графический режим с 3D-вьювером:
+Графический режим с 3D-вьювером — двойной клик по `run.bat` или командой:
 
 ```powershell
 python src/app.py
@@ -35,6 +35,16 @@ python src/main.py samples/model.obj
 ```powershell
 python tools/smoke_test.py
 ```
+
+## Сборка exe
+
+```powershell
+pip install pyinstaller
+pyinstaller --noconfirm --clean --windowed --name 3DCheck --icon assets\logo.ico --add-data "assets;assets" --collect-all OpenGL --collect-data customtkinter --collect-data trimesh --collect-all rtree --paths src src\app.py
+```
+
+Готовое приложение — `dist\3DCheck\3DCheck.exe`. Переносить нужно всю папку `dist\3DCheck`
+целиком, exe без соседних файлов не запустится.
 
 ## Управление вьювером
 
