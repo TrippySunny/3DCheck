@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
 from typing import Callable
@@ -16,6 +17,7 @@ except ModuleNotFoundError:
     from src.analyzer import CRITICAL, OK, WARNING, AnalysisReport, MeshAnalyzer
     from src.viewer import LAYER_COLORS, LAYER_ORDER, LAYER_TITLES, MeshViewer
 
+ASSETS = Path(__file__).resolve().parents[1] / "assets"
 SEVERITY_COLORS = {OK: "#41b06e", WARNING: "#e0a112", CRITICAL: "#e0453e"}
 SEVERITY_TITLES = {OK: "норма", WARNING: "предупреждение", CRITICAL: "критично"}
 FILE_TYPES = [
@@ -47,7 +49,10 @@ class Application(ctk.CTk):
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._report: AnalysisReport | None = None
         self._toggles: dict[str, ctk.CTkCheckBox] = {}
+        self._icon_image: tk.PhotoImage | None = None
+        self.icon_path: Path | None = None
         self.on_report_ready: Callable[[AnalysisReport], None] | None = None
+        self._apply_icon()
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -55,6 +60,23 @@ class Application(ctk.CTk):
         self._build_toolbar()
         self._build_body()
         self._build_statusbar()
+
+    def _apply_icon(self) -> None:
+        icon = ASSETS / "logo.ico"
+        if icon.is_file():
+            try:
+                self.iconbitmap(default=str(icon))
+                self.icon_path = icon
+            except tk.TclError:
+                pass
+        fallback = ASSETS / "logo_256.png"
+        if self.icon_path is None and fallback.is_file():
+            try:
+                self._icon_image = tk.PhotoImage(file=str(fallback))
+                self.iconphoto(True, self._icon_image)
+                self.icon_path = fallback
+            except tk.TclError:
+                pass
 
     def _build_toolbar(self) -> None:
         bar = ctk.CTkFrame(self, corner_radius=0, height=58)

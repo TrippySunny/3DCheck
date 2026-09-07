@@ -6,16 +6,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from analyzer import AnalysisReport
+from analyzer import AnalysisReport, MeshAnalyzer
 from app import Application
 
 SAMPLES = ROOT / "samples"
 OUTPUT = ROOT / "build" / "smoke"
-TARGETS = [
-    SAMPLES / "broken_sphere.obj",
-    SAMPLES / "overtessellated_plane.obj",
-    SAMPLES / "clean_sphere.obj",
-]
+
+
+def collect() -> list[Path]:
+    if not SAMPLES.is_dir():
+        return []
+    return sorted(
+        path
+        for path in SAMPLES.iterdir()
+        if path.is_file() and path.suffix.lower() in MeshAnalyzer.SUPPORTED_EXTENSIONS
+    )
 
 
 def run(app: Application, queue: list[Path]) -> None:
@@ -43,10 +48,15 @@ def run(app: Application, queue: list[Path]) -> None:
 
 
 def main() -> int:
+    targets = collect()
+    if not targets:
+        print(f"Положите модели в {SAMPLES} и запустите снова")
+        return 1
     app = Application()
     app.geometry("1360x820")
     app.update()
-    app.after(600, lambda: run(app, list(TARGETS)))
+    print(f"иконка окна: {app.icon_path}")
+    app.after(600, lambda: run(app, targets))
     app.mainloop()
     return 0
 

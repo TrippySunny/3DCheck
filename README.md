@@ -19,20 +19,21 @@ pip install -r requirements.txt
 
 ```powershell
 python src/app.py
-python src/app.py samples/broken_sphere.obj
+python src/app.py samples/model.obj
 ```
 
 Консольный режим:
 
 ```powershell
 python src/main.py
-python src/main.py samples/broken_sphere.obj
+python src/main.py samples/model.obj
 ```
 
-Тестовые модели (чистая, переуплотнённая, дефектная) генерируются командой:
+Свои модели для проверки складывайте в папку `samples/`. Прогнать по ним интерфейс
+и получить скриншоты в `build/smoke` можно так:
 
 ```powershell
-python tools/make_samples.py
+python tools/smoke_test.py
 ```
 
 ## Управление вьювером
@@ -81,9 +82,9 @@ src/analyzer.py       ядро анализа, класс MeshAnalyzer
 src/viewer.py         OpenGL-вьювер, встроенный в окно
 src/app.py            графический интерфейс на customtkinter
 src/main.py           консольный интерфейс
-tools/make_samples.py генератор тестовых моделей
-tools/smoke_test.py   прогон интерфейса по тестовым моделям со скриншотами
-samples/              готовые модели для проверки
+tools/smoke_test.py   прогон интерфейса по моделям из samples/ со скриншотами
+assets/               логотип и иконка приложения
+samples/              ваши модели для проверки
 ```
 
 ## Планы
