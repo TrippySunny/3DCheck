@@ -4,3 +4,6 @@ scipy>=1.11
 networkx>=3.2
 rtree>=1.2
 customtkinter>=5.2
+PyOpenGL>=3.1.7
+pyopengltk>=0.0.4
+pillow>=10.0

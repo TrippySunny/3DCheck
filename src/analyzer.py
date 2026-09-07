@@ -24,6 +24,7 @@ class CheckResult:
     summary: str
     stats: dict[str, Any] = field(default_factory=dict)
     hints: list[str] = field(default_factory=list)
+    markers: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass
@@ -33,10 +34,18 @@ class AnalysisReport:
     grade: str
     checks: list[CheckResult]
     stats: dict[str, Any]
+    mesh: trimesh.Trimesh | None = None
 
     @property
     def problems(self) -> list[CheckResult]:
         return [check for check in self.checks if check.severity != OK]
+
+    @property
+    def markers(self) -> dict[str, np.ndarray]:
+        merged: dict[str, np.ndarray] = {}
+        for check in self.checks:
+            merged.update(check.markers)
+        return merged
 
 
 class MeshAnalyzer:
@@ -100,6 +109,7 @@ class MeshAnalyzer:
             grade=self._grade(score),
             checks=checks,
             stats=self.summary(),
+            mesh=self.raw,
         )
 
     def summary(self) -> dict[str, Any]:
@@ -120,8 +130,9 @@ class MeshAnalyzer:
         mesh = self.welded
         faces = int(len(mesh.faces))
         area_threshold = max(float(mesh.area) * 1e-9, 1e-12)
-        degenerate = int(np.count_nonzero(mesh.area_faces <= area_threshold))
-        redundant = self._coplanar_redundancy()
+        degenerate_ids = np.flatnonzero(mesh.area_faces <= area_threshold)
+        degenerate = int(degenerate_ids.size)
+        redundant, redundant_ids = self._coplanar_redundancy()
         redundant_ratio = redundant / faces if faces else 0.0
         budget_ratio = faces / self.polygon_budget
 
@@ -164,19 +175,27 @@ class MeshAnalyzer:
                 "budget_usage_percent": round(budget_ratio * 100, 1),
             },
             hints=hints,
+            markers={
+                "faces_degenerate": degenerate_ids,
+                "faces_redundant": redundant_ids,
+            },
         )
 
     def check_normals(self) -> CheckResult:
         mesh = self.welded
         watertight = bool(mesh.is_watertight)
         winding_consistent = bool(mesh.is_winding_consistent)
-        boundary_edges = int(len(trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1)))
+        boundary_rows = np.asarray(
+            trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1), dtype=np.int64
+        )
+        boundary_edges = int(boundary_rows.size)
         broken = int(np.count_nonzero(np.linalg.norm(mesh.face_normals, axis=1) < 0.5))
 
         reference = mesh.copy()
         trimesh.repair.fix_normals(reference, multibody=not watertight)
         dots = np.einsum("ij,ij->i", reference.face_normals, mesh.face_normals)
-        flipped = int(np.count_nonzero(dots < 0.0))
+        flipped_ids = np.flatnonzero(dots < 0.0)
+        flipped = int(flipped_ids.size)
         flipped_ratio = flipped / len(mesh.faces) if len(mesh.faces) else 0.0
         inverted = bool(watertight and float(mesh.volume) < 0.0)
 
@@ -225,6 +244,14 @@ class MeshAnalyzer:
                 "broken_normals": broken,
             },
             hints=hints,
+            markers={
+                "faces_flipped": flipped_ids,
+                "edges_boundary": (
+                    mesh.vertices[mesh.edges_sorted[boundary_rows]]
+                    if boundary_edges
+                    else np.empty((0, 2, 3), dtype=np.float64)
+                ),
+            },
         )
 
     def check_vertices(self) -> CheckResult:
@@ -234,9 +261,11 @@ class MeshAnalyzer:
         duplicate_groups = self._cluster(vertices, self.weld_tolerance, 2)
         duplicated = int(sum(len(group) - 1 for group in duplicate_groups))
         largest_duplicate = int(max((len(group) for group in duplicate_groups), default=0))
-        hotspots = self._hotspots(np.asarray(self.welded.vertices, dtype=np.float64))
+        welded_vertices = np.asarray(self.welded.vertices, dtype=np.float64)
+        hotspots = self._hotspots(welded_vertices)
         largest_hotspot = int(max((len(group) for group in hotspots), default=0))
-        stray = max(total - int(len(np.unique(self.raw.faces))), 0)
+        stray_ids = np.setdiff1d(np.arange(total), np.unique(self.raw.faces))
+        stray = int(stray_ids.size)
         duplicate_ratio = duplicated / total if total else 0.0
 
         penalty = 0.0
@@ -290,20 +319,36 @@ class MeshAnalyzer:
                 "format_splits_vertices": split_by_format,
             },
             hints=hints,
+            markers={
+                "points_duplicates": (
+                    vertices[[int(group[0]) for group in duplicate_groups]]
+                    if duplicate_groups and not split_by_format
+                    else np.empty((0, 3), dtype=np.float64)
+                ),
+                "points_hotspots": (
+                    welded_vertices[np.concatenate(hotspots)]
+                    if hotspots
+                    else np.empty((0, 3), dtype=np.float64)
+                ),
+                "points_stray": vertices[stray_ids],
+            },
         )
 
-    def _coplanar_redundancy(self) -> int:
+    def _coplanar_redundancy(self) -> tuple[int, np.ndarray]:
         mesh = self.welded
+        empty = np.empty(0, dtype=np.int64)
         if len(mesh.faces) > self.FACET_FACE_LIMIT:
-            return 0
+            return 0, empty
         total = 0
+        marked: list[np.ndarray] = []
         for facet, boundary in zip(mesh.facets, mesh.facets_boundary):
             used = int(len(facet))
             outline = int(len(np.unique(boundary)))
             minimal = max(outline - 2, 1)
             if used > minimal:
                 total += used - minimal
-        return total
+                marked.append(np.asarray(facet, dtype=np.int64))
+        return total, np.concatenate(marked) if marked else empty
 
     def _cluster(self, points: np.ndarray, radius: float, min_size: int) -> list[np.ndarray]:
         if len(points) < min_size or radius <= 0.0:
