@@ -132,13 +132,15 @@ class MeshAnalyzer:
             self.check_vertices(),
             self.check_curvature(),
         ]
+        stats = self.summary()
+        stats.update(self._optimization(checks, stats))
         score = float(np.clip(100.0 - sum(check.penalty for check in checks), 0.0, 100.0))
         return AnalysisReport(
             source=self.path,
             score=score,
             grade=self._grade(score),
             checks=checks,
-            stats=self.summary(),
+            stats=stats,
             mesh=self.welded,
         )
 
@@ -146,6 +148,7 @@ class MeshAnalyzer:
         return {
             "file": self.path.name,
             "format": self.path.suffix.lower(),
+            "size_bytes": int(self.path.stat().st_size),
             "size_mb": round(self.path.stat().st_size / 1024 / 1024, 2),
             "faces": int(len(self.raw.faces)),
             "vertices": int(len(self.raw.vertices)),
@@ -155,6 +158,36 @@ class MeshAnalyzer:
             "dimensions": [round(float(value), 4) for value in self.raw.extents],
             "surface_area": round(float(self.welded.area), 4),
             "watertight": bool(self.welded.is_watertight),
+        }
+
+    def _optimization(self, checks: list[CheckResult], stats: dict[str, Any]) -> dict[str, Any]:
+        by_code = {check.code: check for check in checks}
+        faces = int(stats["faces"])
+        size_bytes = int(stats.get("size_bytes") or round(float(stats["size_mb"]) * 1024 * 1024))
+        polygons = by_code.get("polygons")
+        density = by_code.get("density")
+        redundant = int(polygons.stats.get("redundant_faces", 0) if polygons else 0)
+        degenerate = int(polygons.stats.get("degenerate_faces", 0) if polygons else 0)
+        excess = int(density.stats.get("excess_faces", 0) if density else 0)
+        budget = int(polygons.stats.get("budget", self.polygon_budget) if polygons else self.polygon_budget)
+        over_budget = max(faces - budget, 0)
+        removable = min(faces, max(redundant + excess + degenerate, over_budget))
+        keep = max(faces - removable, 0)
+        percent = round(removable / faces * 100.0, 1) if faces else 0.0
+        ratio = keep / faces if faces else 1.0
+        after_bytes = int(round(size_bytes * (0.2 + 0.8 * ratio)))
+        saved_bytes = max(size_bytes - after_bytes, 0)
+        saved_percent = round(saved_bytes / size_bytes * 100.0, 1) if size_bytes else 0.0
+        return {
+            "faces_removable": removable,
+            "faces_after": keep,
+            "optimize_percent": percent,
+            "size_bytes": size_bytes,
+            "size_after_bytes": after_bytes,
+            "size_saved_bytes": saved_bytes,
+            "size_after_mb": round(after_bytes / 1024 / 1024, 2),
+            "size_saved_mb": round(saved_bytes / 1024 / 1024, 2),
+            "size_saved_percent": saved_percent,
         }
 
     def check_polygons(self) -> CheckResult:
