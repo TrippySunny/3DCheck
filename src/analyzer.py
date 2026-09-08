@@ -10,28 +10,42 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import KDTree
 
+try:
+    from i18n import FALLBACK, Message, Translator, msg
+except ModuleNotFoundError:
+    from src.i18n import FALLBACK, Message, Translator, msg
+
 OK = "ok"
 WARNING = "warning"
 CRITICAL = "critical"
 
 
+class AnalyzerError(Exception):
+    def __init__(self, message: Message) -> None:
+        super().__init__(Translator(FALLBACK)(message))
+        self.message = message
+
+
 @dataclass
 class CheckResult:
     code: str
-    title: str
     severity: str
     penalty: float
-    summary: str
+    summary: Message
     stats: dict[str, Any] = field(default_factory=dict)
-    hints: list[str] = field(default_factory=list)
+    hints: list[Message] = field(default_factory=list)
     markers: dict[str, np.ndarray] = field(default_factory=dict)
+
+    @property
+    def title(self) -> Message:
+        return msg(f"check.{self.code}.title")
 
 
 @dataclass
 class AnalysisReport:
     source: Path
     score: float
-    grade: str
+    grade: Message
     checks: list[CheckResult]
     stats: dict[str, Any]
     mesh: trimesh.Trimesh | None = None
@@ -61,17 +75,25 @@ class MeshAnalyzer:
     )
     TOPOLOGY_FORMATS: tuple[str, ...] = (".obj", ".ply", ".off")
     POLYGON_BUDGET: int = 100_000
+    ABSURD_FACE_MIN: int = 1_000_000
+    ABSURD_SMOOTH_FACES: int = 150_000
+    OVERDENSE_SMOOTH_MAX: float = 12.0
+    OVERDENSE_ANGLE: float = 8.0
+    OVERDENSE_TARGET: float = 10.0
+    OVERDENSE_REGION_MIN: int = 64
     FACET_FACE_LIMIT: int = 400_000
-    FACET_ANGLE_MIN: float = 18.0
+    FACET_ANGLE_MIN: float = 38.0
     FACET_ANGLE_MAX: float = 65.0
+    CREASE_LIST_MIN: float = 8.0
+    CREASE_LIST_MAX: float = 80.0
     FACET_REGION_MIN: int = 4
     HOTSPOT_MIN_VERTICES: int = 6
     GRADES: tuple[tuple[float, str], ...] = (
-        (90.0, "Отличная оптимизация"),
-        (75.0, "Хорошо, есть мелкие замечания"),
-        (55.0, "Средне, модель требует доработки"),
-        (35.0, "Плохо, много дефектов геометрии"),
-        (0.0, "Критично, модель стоит переделать"),
+        (90.0, "grade.excellent"),
+        (75.0, "grade.good"),
+        (55.0, "grade.average"),
+        (35.0, "grade.poor"),
+        (0.0, "grade.critical"),
     )
 
     def __init__(self, path: str | Path, polygon_budget: int | None = None) -> None:
@@ -88,22 +110,24 @@ class MeshAnalyzer:
 
     def _load(self) -> trimesh.Trimesh:
         if not self.path.is_file():
-            raise FileNotFoundError(f"Файл не найден: {self.path}")
+            raise AnalyzerError(msg("error.not_found", path=self.path))
         suffix = self.path.suffix.lower()
         if suffix not in self.SUPPORTED_EXTENSIONS:
-            supported = ", ".join(self.SUPPORTED_EXTENSIONS)
-            raise ValueError(f"Формат «{suffix}» не поддерживается. Доступные: {supported}")
+            raise AnalyzerError(
+                msg("error.format", suffix=suffix, supported=", ".join(self.SUPPORTED_EXTENSIONS))
+            )
         loaded = trimesh.load(self.path, force="mesh", process=False)
         if isinstance(loaded, trimesh.Scene):
             parts = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
             loaded = trimesh.util.concatenate(parts) if parts else None
         if not isinstance(loaded, trimesh.Trimesh) or len(loaded.faces) == 0:
-            raise ValueError("В файле не найдено полигональной сетки")
+            raise AnalyzerError(msg("error.no_mesh"))
         return loaded
 
     def analyze(self) -> AnalysisReport:
         checks = [
             self.check_polygons(),
+            self.check_density(),
             self.check_normals(),
             self.check_vertices(),
             self.check_curvature(),
@@ -115,7 +139,7 @@ class MeshAnalyzer:
             grade=self._grade(score),
             checks=checks,
             stats=self.summary(),
-            mesh=self.raw,
+            mesh=self.welded,
         )
 
     def summary(self) -> dict[str, Any]:
@@ -147,32 +171,38 @@ class MeshAnalyzer:
         if degenerate:
             penalty += min(15.0, 4.0 + degenerate / faces * 120.0)
         if budget_ratio > 1.0:
-            penalty += min(15.0, (budget_ratio - 1.0) * 8.0)
+            penalty += min(55.0, (budget_ratio - 1.0) * 18.0)
 
-        hints: list[str] = []
+        hints: list[Message] = []
         if redundant_ratio > 0.05:
             hints.append(
-                f"На плоских участках можно убрать ~{redundant} треугольников "
-                f"({redundant_ratio * 100:.1f}% сетки): Blender → Mesh → Limited Dissolve"
+                msg(
+                    "check.polygons.hint.redundant",
+                    count=redundant,
+                    percent=f"{redundant_ratio * 100:.1f}",
+                )
             )
         if degenerate:
-            hints.append(
-                f"Вырожденных полигонов (нулевая площадь): {degenerate}. "
-                "Blender → Mesh → Clean Up → Degenerate Dissolve"
-            )
+            hints.append(msg("check.polygons.hint.degenerate", count=degenerate))
         if budget_ratio > 1.0:
-            budget_text = f"{self.polygon_budget:,}".replace(",", " ")
             hints.append(
-                f"Полигонаж превышает бюджет {budget_text} на "
-                f"{(budget_ratio - 1.0) * 100:.0f}% — нужен Decimate или ретопология"
+                msg(
+                    "check.polygons.hint.budget",
+                    budget=f"{self.polygon_budget:,}".replace(",", " "),
+                    percent=f"{(budget_ratio - 1.0) * 100:.0f}",
+                )
             )
 
         return CheckResult(
             code="polygons",
-            title="Лишние полигоны",
             severity=self._severity(penalty),
             penalty=penalty,
-            summary=f"{faces} полигонов, лишних ~{redundant}, вырожденных {degenerate}",
+            summary=msg(
+                "check.polygons.summary",
+                faces=faces,
+                redundant=redundant,
+                degenerate=degenerate,
+            ),
             stats={
                 "faces": faces,
                 "redundant_faces": redundant,
@@ -186,6 +216,51 @@ class MeshAnalyzer:
                 "faces_degenerate": degenerate_ids,
                 "faces_redundant": redundant_ids,
             },
+        )
+
+    def check_density(self) -> CheckResult:
+        mesh = self.welded
+        faces = int(len(mesh.faces))
+        overdense_ids, regions, excess, average = self._overdense_regions()
+        area = float(mesh.area)
+        share = (
+            float(mesh.area_faces[overdense_ids].sum() / area)
+            if overdense_ids.size and area > 0
+            else 0.0
+        )
+        penalty = (
+            min(40.0, share * 32.0 + min(18.0, excess / max(faces, 1) * 40.0)) if regions else 0.0
+        )
+        hints: list[Message] = []
+        if regions:
+            hints.append(msg("check.density.hint", mean=f"{average:.1f}"))
+        if faces >= self.ABSURD_FACE_MIN or overdense_ids.size >= self.ABSURD_SMOOTH_FACES:
+            hints.append(msg("check.polygons.hint.absurd"))
+            penalty = max(penalty, 40.0)
+
+        return CheckResult(
+            code="density",
+            severity=self._severity(penalty),
+            penalty=penalty,
+            summary=(
+                msg(
+                    "check.density.summary.bad",
+                    regions=regions,
+                    faces=int(overdense_ids.size),
+                    excess=excess,
+                )
+                if regions
+                else msg("check.density.summary.ok")
+            ),
+            stats={
+                "overdense_regions": regions,
+                "overdense_faces": int(overdense_ids.size),
+                "excess_faces": excess,
+                "area_percent": round(share * 100, 1),
+                "mean_angle": round(average, 2),
+            },
+            hints=hints,
+            markers={"faces_overdense": overdense_ids},
         )
 
     def check_normals(self) -> CheckResult:
@@ -210,25 +285,32 @@ class MeshAnalyzer:
         if broken:
             penalty += 5.0
 
-        hints: list[str] = []
+        hints: list[Message] = []
         if flipped:
             hints.append(
-                f"Вывернуто наружу/внутрь полигонов: {flipped} ({flipped_ratio * 100:.1f}%). "
-                "Blender → Edit Mode → Shift+N (Recalculate Outside)"
+                msg(
+                    "check.normals.hint.flipped",
+                    count=flipped,
+                    percent=f"{flipped_ratio * 100:.1f}",
+                )
             )
         if inverted:
-            hints.append("Нормали всей модели смотрят внутрь — объём отрицательный, нужен Flip Normals")
+            hints.append(msg("check.normals.hint.inverted"))
         if broken:
-            hints.append(f"Полигонов без валидной нормали: {broken} (нулевая площадь или дубли вершин)")
+            hints.append(msg("check.normals.hint.broken", count=broken))
 
         return CheckResult(
             code="normals",
-            title="Неправильные нормали",
             severity=self._severity(penalty),
             penalty=penalty,
-            summary=(
-                f"вывернутых полигонов {flipped}, обход вершин "
-                f"{'согласован' if winding_consistent else 'не согласован'}"
+            summary=msg(
+                "check.normals.summary",
+                flipped=flipped,
+                winding=msg(
+                    "check.normals.winding.ok"
+                    if winding_consistent
+                    else "check.normals.winding.bad"
+                ),
             ),
             stats={
                 "is_watertight": watertight,
@@ -274,42 +356,48 @@ class MeshAnalyzer:
         if stray:
             penalty += min(6.0, 2.0 + stray / total * 40.0)
 
-        hints: list[str] = []
+        hints: list[Message] = []
         if split_by_format and duplicated:
-            keeps = ", ".join(self.TOPOLOGY_FORMATS)
             hints.append(
-                f"Формат {self.path.suffix.lower()} разрезает вершины по нормалям и UV, поэтому "
-                f"{duplicated} совпадений — особенность контейнера, а не дефект модели. "
-                f"Чтобы проверить сварку вершин, экспортируйте в {keeps}"
+                msg(
+                    "check.vertices.hint.container",
+                    suffix=self.path.suffix.lower(),
+                    count=duplicated,
+                    formats=", ".join(self.TOPOLOGY_FORMATS),
+                )
             )
         elif duplicated and not duplicate_groups:
-            hints.append(
-                f"Merge by Distance убрал бы {duplicated} вершин "
-                "(M → By Distance в режиме редактирования)"
-            )
+            hints.append(msg("check.vertices.hint.merge", count=duplicated))
         elif duplicated:
-            places = len(duplicate_groups)
             hints.append(
-                f"Дублирующихся вершин: {duplicated} в {places} "
-                f"{'точке' if places == 1 else 'точках'} (максимум {largest_duplicate} в одной). "
-                "Blender → Merge by Distance (M → By Distance)"
+                msg(
+                    "check.vertices.hint.duplicates",
+                    count=duplicated,
+                    places=len(duplicate_groups),
+                    largest=largest_duplicate,
+                )
             )
         if hotspots:
             hints.append(
-                f"Скоплений вершин в микрообъёме: {len(hotspots)}, крупнейшее — {largest_hotspot} вершин. "
-                "Проверь эти зоны на схлопнутую геометрию"
+                msg(
+                    "check.vertices.hint.hotspots",
+                    count=len(hotspots),
+                    largest=largest_hotspot,
+                )
             )
         if stray:
-            hints.append(f"Вершин, не входящих ни в один полигон: {stray} → Clean Up → Delete Loose")
+            hints.append(msg("check.vertices.hint.stray", count=stray))
 
         return CheckResult(
             code="vertices",
-            title="Дубли и скопления вершин",
             severity=self._severity(penalty),
             penalty=penalty,
-            summary=(
-                f"{total} вершин, дублей {duplicated}, скоплений {len(hotspots)}, "
-                f"потерянных {stray}"
+            summary=msg(
+                "check.vertices.summary",
+                total=total,
+                duplicated=duplicated,
+                hotspots=len(hotspots),
+                stray=stray,
             ),
             stats={
                 "vertices": total,
@@ -348,9 +436,13 @@ class MeshAnalyzer:
         regions = 0
         worst = 0.0
         average = 0.0
+        creases = np.empty(0, dtype=np.float64)
 
         if pairs.size and faces:
             angles = np.degrees(np.asarray(mesh.face_adjacency_angles, dtype=np.float64))
+            creases = angles[
+                (angles >= self.CREASE_LIST_MIN) & (angles <= self.CREASE_LIST_MAX)
+            ]
             bends = (angles >= self.FACET_ANGLE_MIN) & (angles <= self.FACET_ANGLE_MAX)
             if np.any(bends):
                 touched = np.zeros(faces, dtype=bool)
@@ -380,37 +472,109 @@ class MeshAnalyzer:
         penalty = (
             min(22.0, share * 25.0 + average / self.FACET_ANGLE_MAX * 10.0) if regions else 0.0
         )
-
-        hints: list[str] = []
+        angle_text = self._format_angles(creases)
+        hints: list[Message] = []
         if regions:
             hints.append(
-                f"Плавные поверхности собраны из плоских кусков: излом в среднем {average:.0f}°, "
-                f"максимум {worst:.0f}°, задето {share * 100:.0f}% площади. Добавьте рёбер "
-                "на этих участках или примените Subdivision Surface"
+                msg(
+                    "check.curvature.hint",
+                    angles=angle_text or f"{average:.0f}°",
+                    percent=f"{share * 100:.0f}",
+                )
             )
+
+        if regions:
+            summary = msg(
+                "check.curvature.summary.bad",
+                regions=regions,
+                faces=int(faceted_ids.size),
+                angles=angle_text or f"{average:.0f}°",
+            )
+        elif angle_text:
+            summary = msg("check.curvature.summary.listed", angles=angle_text)
+        else:
+            summary = msg("check.curvature.summary.ok")
 
         return CheckResult(
             code="curvature",
-            title="Нехватка полигонов на изгибах",
             severity=self._severity(penalty),
             penalty=penalty,
-            summary=(
-                f"{regions} угловатых зон, {faceted_ids.size} полигонов, "
-                f"средний излом {average:.0f}°"
-                if regions
-                else "резких изломов на плавных поверхностях нет"
-            ),
+            summary=summary,
             stats={
                 "faceted_regions": regions,
                 "faceted_faces": int(faceted_ids.size),
                 "area_percent": round(share * 100, 1),
                 "mean_angle": round(average, 1),
                 "max_angle": round(worst, 1),
+                "crease_angles": [int(value) for value in np.unique(np.round(creases, 0))]
+                if creases.size
+                else [],
                 "angle_window": [self.FACET_ANGLE_MIN, self.FACET_ANGLE_MAX],
             },
             hints=hints,
             markers={"faces_faceted": faceted_ids},
         )
+
+    @staticmethod
+    def _format_angles(degrees: np.ndarray) -> str:
+        if degrees.size == 0:
+            return ""
+        unique = np.unique(np.round(degrees, 0).astype(np.int64))
+        return ", ".join(f"{int(value)}°" for value in unique)
+
+    def _overdense_regions(self) -> tuple[np.ndarray, int, int, float]:
+        mesh = self.welded
+        empty = np.empty(0, dtype=np.int64)
+        faces = int(len(mesh.faces))
+        pairs = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+        if not pairs.size or not faces:
+            return empty, 0, 0, 0.0
+        angles = np.degrees(np.asarray(mesh.face_adjacency_angles, dtype=np.float64))
+        smooth = angles <= self.OVERDENSE_SMOOTH_MAX
+        if not np.any(smooth):
+            return empty, 0, 0, 0.0
+        selected = pairs[smooth]
+        graph = coo_matrix(
+            (np.ones(len(selected), dtype=np.int8), (selected[:, 0], selected[:, 1])),
+            shape=(faces, faces),
+        )
+        _, labels = connected_components(graph, directed=False)
+        counts = np.bincount(labels, minlength=int(labels.max()) + 1)
+        left = labels[pairs[:, 0]]
+        right = labels[pairs[:, 1]]
+        marked: list[np.ndarray] = []
+        excess = 0
+        regions = 0
+        collected: list[float] = []
+        for cid in np.flatnonzero(counts >= self.OVERDENSE_REGION_MIN):
+            inside = (left == cid) & (right == cid)
+            if not np.any(inside):
+                continue
+            mean_angle = float(angles[inside].mean())
+            if mean_angle > self.OVERDENSE_ANGLE:
+                continue
+            members = np.flatnonzero(labels == cid)
+            if self._region_is_planar(members):
+                continue
+            count = int(members.size)
+            target = max(
+                self.OVERDENSE_REGION_MIN,
+                int(count * (mean_angle / self.OVERDENSE_TARGET) ** 2),
+            )
+            if count <= target:
+                continue
+            marked.append(members)
+            excess += count - target
+            regions += 1
+            collected.append(mean_angle)
+        ids = np.concatenate(marked) if marked else empty
+        average = float(np.mean(collected)) if collected else 0.0
+        if ids.size == 0 and faces >= self.ABSURD_SMOOTH_FACES and angles.size:
+            mean_all = float(angles.mean())
+            if mean_all <= self.OVERDENSE_ANGLE and not self._region_is_planar(np.arange(faces)):
+                leftover = max(faces - self.OVERDENSE_REGION_MIN, 0)
+                return np.arange(faces, dtype=np.int64), 1, leftover, mean_all
+        return ids, regions, excess, average
 
     def _coplanar_redundancy(self) -> tuple[int, np.ndarray]:
         mesh = self.welded
@@ -421,11 +585,25 @@ class MeshAnalyzer:
         marked: list[np.ndarray] = []
         for facet, boundary in zip(mesh.facets, mesh.facets_boundary):
             used = int(len(facet))
-            minimal = max(self._boundary_corners(boundary) - 2, 1)
+            corners = self._boundary_corners(boundary)
+            if corners < 3 or not self._facet_is_planar(facet):
+                continue
+            minimal = max(corners - 2, 1)
             if used > minimal:
                 total += used - minimal
                 marked.append(np.asarray(facet, dtype=np.int64))
         return total, np.concatenate(marked) if marked else empty
+
+    def _facet_is_planar(self, facet: np.ndarray) -> bool:
+        return self._region_is_planar(np.asarray(facet, dtype=np.int64))
+
+    def _region_is_planar(self, face_ids: np.ndarray) -> bool:
+        points = self.welded.vertices[np.unique(self.welded.faces[face_ids])]
+        if len(points) < 4:
+            return True
+        centered = points - points.mean(axis=0)
+        singular = np.linalg.svd(centered, compute_uv=False)
+        return float(singular[-1] / (singular[0] + 1e-12)) <= 0.02
 
     def _declared_vertex_count(self) -> int | None:
         suffix = self.path.suffix.lower()
@@ -531,8 +709,8 @@ class MeshAnalyzer:
         return OK
 
     @classmethod
-    def _grade(cls, score: float) -> str:
-        for threshold, label in cls.GRADES:
+    def _grade(cls, score: float) -> Message:
+        for threshold, key in cls.GRADES:
             if score >= threshold:
-                return label
-        return cls.GRADES[-1][1]
+                return msg(key)
+        return msg(cls.GRADES[-1][1])

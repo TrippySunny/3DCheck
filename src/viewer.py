@@ -9,32 +9,40 @@ from OpenGL import GL, GLU
 from PIL import Image
 from pyopengltk import OpenGLFrame
 
-BACKGROUND = (0.11, 0.12, 0.15, 1.0)
-BASE_COLOR = (0.72, 0.74, 0.78)
-WIRE_COLOR = (0.20, 0.22, 0.26)
-
-FACE_LAYERS: dict[str, tuple[str, tuple[float, float, float]]] = {
-    "faces_redundant": ("Лишние полигоны", (0.96, 0.82, 0.20)),
-    "faces_faceted": ("Нехватка полигонов", (0.42, 0.55, 1.00)),
-    "faces_degenerate": ("Вырожденные полигоны", (1.00, 0.52, 0.10)),
-    "faces_flipped": ("Вывернутые нормали", (0.94, 0.22, 0.24)),
+THEMES: dict[str, dict[str, tuple[float, ...]]] = {
+    "dark": {
+        "background": (0.10, 0.12, 0.15, 1.0),
+        "base": (0.59, 0.67, 0.77),
+        "wire": (0.23, 0.27, 0.35),
+        "ambient": (0.22, 0.24, 0.28, 1.0),
+    },
+    "light": {
+        "background": (0.91, 0.93, 0.95, 1.0),
+        "base": (0.42, 0.51, 0.64),
+        "wire": (0.38, 0.51, 0.73),
+        "ambient": (0.42, 0.46, 0.52, 1.0),
+    },
 }
-POINT_LAYERS: dict[str, tuple[str, tuple[float, float, float]]] = {
-    "points_duplicates": ("Дубли вершин", (1.00, 0.24, 0.85)),
-    "points_hotspots": ("Скопления вершин", (0.20, 0.95, 0.92)),
-    "points_stray": ("Вершины вне полигонов", (1.00, 1.00, 1.00)),
+
+FACE_LAYERS: dict[str, tuple[float, float, float]] = {
+    "faces_overdense": (0.70, 0.32, 1.00),
+    "faces_redundant": (0.96, 0.82, 0.20),
+    "faces_faceted": (0.42, 0.55, 1.00),
+    "faces_degenerate": (1.00, 0.52, 0.10),
+    "faces_flipped": (0.94, 0.22, 0.24),
+}
+POINT_LAYERS: dict[str, tuple[float, float, float]] = {
+    "points_duplicates": (1.00, 0.24, 0.85),
+    "points_hotspots": (0.20, 0.95, 0.92),
+    "points_stray": (1.00, 1.00, 1.00),
 }
 LAYER_ORDER: list[str] = [*FACE_LAYERS, *POINT_LAYERS]
-LAYER_TITLES: dict[str, str] = {
-    key: value[0] for group in (FACE_LAYERS, POINT_LAYERS) for key, value in group.items()
-}
-LAYER_COLORS: dict[str, tuple[float, float, float]] = {
-    key: value[1] for group in (FACE_LAYERS, POINT_LAYERS) for key, value in group.items()
-}
+LAYER_COLORS: dict[str, tuple[float, float, float]] = {**FACE_LAYERS, **POINT_LAYERS}
+XRAY_ALPHA: float = 0.5
 
 
 class MeshViewer(OpenGLFrame):
-    def __init__(self, master: tk.Misc, **kwargs: object) -> None:
+    def __init__(self, master: tk.Misc, theme: str = "dark", **kwargs: object) -> None:
         super().__init__(master, **kwargs)
         self.animate = 0
         self.width = 1
@@ -43,10 +51,9 @@ class MeshViewer(OpenGLFrame):
         self._positions: np.ndarray | None = None
         self._normals: np.ndarray | None = None
         self._colors: np.ndarray | None = None
-        self._base_colors: np.ndarray | None = None
-        self._faces: np.ndarray | None = None
         self._markers: dict[str, np.ndarray] = {}
         self._points: dict[str, np.ndarray] = {}
+        self._overlays: dict[str, np.ndarray] = {}
 
         self._center = np.zeros(3, dtype=np.float64)
         self._radius = 1.0
@@ -57,7 +64,9 @@ class MeshViewer(OpenGLFrame):
         self._drag: tuple[int, int] | None = None
         self._drag_mode = "rotate"
 
+        self.theme = theme if theme in THEMES else "dark"
         self.wireframe = False
+        self.xray = False
         self.visible: dict[str, bool] = {key: True for key in LAYER_ORDER}
 
         self.bind("<ButtonPress-1>", self._on_press_rotate)
@@ -73,23 +82,21 @@ class MeshViewer(OpenGLFrame):
     def set_mesh(self, mesh: trimesh.Trimesh, markers: dict[str, np.ndarray] | None = None) -> None:
         faces = np.asarray(mesh.faces, dtype=np.int64)
         vertices = np.asarray(mesh.vertices, dtype=np.float64)
-        self._faces = faces
         self._positions = vertices[faces].reshape(-1, 3).astype(np.float32)
         self._normals = np.repeat(
             np.asarray(mesh.face_normals, dtype=np.float32), 3, axis=0
         ).astype(np.float32)
-        self._base_colors = np.tile(
-            np.array(BASE_COLOR, dtype=np.float32), (len(self._positions), 1)
-        )
         self._markers = dict(markers or {})
         self._points = {
             key: np.asarray(self._markers.get(key, np.empty((0, 3))), dtype=np.float32)
             for key in POINT_LAYERS
         }
+        self.visible = {key: True for key in LAYER_ORDER}
 
         bounds = np.asarray(mesh.bounds, dtype=np.float64)
         self._center = bounds.mean(axis=0)
         self._radius = float(np.linalg.norm(bounds[1] - bounds[0])) * 0.5 or 1.0
+        self._rebuild_overlays()
         self._rebuild_colors()
         self.reset_view()
 
@@ -97,7 +104,9 @@ class MeshViewer(OpenGLFrame):
         self._positions = None
         self._normals = None
         self._colors = None
+        self._markers = {}
         self._points = {}
+        self._overlays = {}
         self.refresh()
 
     def reset_view(self) -> None:
@@ -122,6 +131,15 @@ class MeshViewer(OpenGLFrame):
         self.wireframe = bool(state)
         self.refresh()
 
+    def set_xray(self, state: bool) -> None:
+        self.xray = bool(state)
+        self.refresh()
+
+    def set_theme(self, theme: str) -> None:
+        self.theme = theme if theme in THEMES else "dark"
+        self._rebuild_colors()
+        self.refresh()
+
     def refresh(self) -> None:
         if self.winfo_ismapped():
             self.tkExpose(None)
@@ -141,22 +159,35 @@ class MeshViewer(OpenGLFrame):
         self.tkSwapBuffers()
         return target
 
+    def _face_corners(self, key: str) -> np.ndarray:
+        ids = np.asarray(self._markers.get(key, np.empty(0)), dtype=np.int64)
+        if ids.size == 0:
+            return np.empty(0, dtype=np.uint32)
+        return (ids[:, None] * 3 + np.arange(3)[None, :]).ravel().astype(np.uint32)
+
+    def _rebuild_overlays(self) -> None:
+        self._overlays = {}
+        for key in FACE_LAYERS:
+            corners = self._face_corners(key)
+            if corners.size:
+                self._overlays[key] = corners
+
     def _rebuild_colors(self) -> None:
-        if self._base_colors is None:
+        if self._positions is None:
             return
-        colors = self._base_colors.copy()
-        for key, (_, color) in FACE_LAYERS.items():
+        colors = np.tile(
+            np.array(THEMES[self.theme]["base"], dtype=np.float32), (len(self._positions), 1)
+        )
+        for key, color in FACE_LAYERS.items():
             if not self.visible.get(key, True):
                 continue
-            ids = np.asarray(self._markers.get(key, np.empty(0)), dtype=np.int64)
-            if ids.size == 0:
+            corners = self._overlays.get(key)
+            if corners is None:
                 continue
-            corners = (ids[:, None] * 3 + np.arange(3)[None, :]).ravel()
             colors[corners] = np.array(color, dtype=np.float32)
         self._colors = colors
 
     def initgl(self) -> None:
-        GL.glClearColor(*BACKGROUND)
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glEnable(GL.GL_NORMALIZE)
         GL.glEnable(GL.GL_LIGHTING)
@@ -169,7 +200,6 @@ class MeshViewer(OpenGLFrame):
         GL.glLightfv(GL.GL_LIGHT0, GL.GL_DIFFUSE, (0.85, 0.85, 0.85, 1.0))
         GL.glLightfv(GL.GL_LIGHT1, GL.GL_POSITION, (-0.6, -0.3, -0.8, 0.0))
         GL.glLightfv(GL.GL_LIGHT1, GL.GL_DIFFUSE, (0.35, 0.35, 0.40, 1.0))
-        GL.glLightModelfv(GL.GL_LIGHT_MODEL_AMBIENT, (0.25, 0.25, 0.28, 1.0))
         GL.glEnable(GL.GL_POINT_SMOOTH)
         GL.glHint(GL.GL_POINT_SMOOTH_HINT, GL.GL_NICEST)
 
@@ -181,6 +211,9 @@ class MeshViewer(OpenGLFrame):
             GL.glViewport(0, 0, self.width, self.height)
 
     def redraw(self) -> None:
+        palette = THEMES[self.theme]
+        GL.glClearColor(*palette["background"])
+        GL.glLightModelfv(GL.GL_LIGHT_MODEL_AMBIENT, palette["ambient"])
         GL.glViewport(0, 0, self.width, self.height)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         if self._positions is None:
@@ -200,6 +233,7 @@ class MeshViewer(OpenGLFrame):
         GL.glTranslatef(*(-self._center))
 
         self._draw_surface()
+        self._draw_xray()
         self._draw_points()
 
     def _draw_surface(self) -> None:
@@ -219,12 +253,32 @@ class MeshViewer(OpenGLFrame):
         if self.wireframe:
             GL.glDisable(GL.GL_LIGHTING)
             GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
-            GL.glColor3f(*WIRE_COLOR)
+            GL.glColor3f(*THEMES[self.theme]["wire"])
             GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._positions))
             GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
             GL.glEnable(GL.GL_LIGHTING)
 
         GL.glDisableClientState(GL.GL_VERTEX_ARRAY)
+
+    def _draw_xray(self) -> None:
+        if not self.xray or not self._overlays:
+            return
+        GL.glDisable(GL.GL_LIGHTING)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
+        GL.glVertexPointer(3, GL.GL_FLOAT, 0, self._positions)
+        for key, corners in self._overlays.items():
+            if not self.visible.get(key, True):
+                continue
+            red, green, blue = LAYER_COLORS[key]
+            GL.glColor4f(red, green, blue, XRAY_ALPHA)
+            GL.glDrawElements(GL.GL_TRIANGLES, len(corners), GL.GL_UNSIGNED_INT, corners)
+        GL.glDisableClientState(GL.GL_VERTEX_ARRAY)
+        GL.glDisable(GL.GL_BLEND)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glEnable(GL.GL_LIGHTING)
 
     def _draw_points(self) -> None:
         GL.glDisable(GL.GL_LIGHTING)
