@@ -62,7 +62,9 @@ class MeshAnalyzer:
     TOPOLOGY_FORMATS: tuple[str, ...] = (".obj", ".ply", ".off")
     POLYGON_BUDGET: int = 100_000
     FACET_FACE_LIMIT: int = 400_000
-    MARK_MIN_EXCESS: int = 2
+    FACET_ANGLE_MIN: float = 18.0
+    FACET_ANGLE_MAX: float = 65.0
+    FACET_REGION_MIN: int = 4
     HOTSPOT_MIN_VERTICES: int = 6
     GRADES: tuple[tuple[float, str], ...] = (
         (90.0, "Отличная оптимизация"),
@@ -104,6 +106,7 @@ class MeshAnalyzer:
             self.check_polygons(),
             self.check_normals(),
             self.check_vertices(),
+            self.check_curvature(),
         ]
         score = float(np.clip(100.0 - sum(check.penalty for check in checks), 0.0, 100.0))
         return AnalysisReport(
@@ -189,10 +192,6 @@ class MeshAnalyzer:
         mesh = self.welded
         watertight = bool(mesh.is_watertight)
         winding_consistent = bool(mesh.is_winding_consistent)
-        boundary_rows = np.asarray(
-            trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1), dtype=np.int64
-        )
-        boundary_edges = int(boundary_rows.size)
         broken = int(np.count_nonzero(np.linalg.norm(mesh.face_normals, axis=1) < 0.5))
 
         reference = mesh.copy()
@@ -208,8 +207,6 @@ class MeshAnalyzer:
             penalty += 10.0
         if inverted:
             penalty += 12.0
-        if not watertight:
-            penalty += min(10.0, 3.0 + boundary_edges / max(len(mesh.edges_sorted), 1) * 40.0)
         if broken:
             penalty += 5.0
 
@@ -221,11 +218,6 @@ class MeshAnalyzer:
             )
         if inverted:
             hints.append("Нормали всей модели смотрят внутрь — объём отрицательный, нужен Flip Normals")
-        if not watertight:
-            hints.append(
-                f"Меш не замкнут: {boundary_edges} граничных рёбер (дыры или несшитые края). "
-                "Select → All by Trait → Non Manifold"
-            )
         if broken:
             hints.append(f"Полигонов без валидной нормали: {broken} (нулевая площадь или дубли вершин)")
 
@@ -235,27 +227,19 @@ class MeshAnalyzer:
             severity=self._severity(penalty),
             penalty=penalty,
             summary=(
-                f"watertight={'да' if watertight else 'нет'}, "
-                f"вывернутых полигонов {flipped}, граничных рёбер {boundary_edges}"
+                f"вывернутых полигонов {flipped}, обход вершин "
+                f"{'согласован' if winding_consistent else 'не согласован'}"
             ),
             stats={
                 "is_watertight": watertight,
                 "winding_consistent": winding_consistent,
                 "flipped_faces": flipped,
                 "flipped_percent": round(flipped_ratio * 100, 2),
-                "boundary_edges": boundary_edges,
                 "inverted_volume": inverted,
                 "broken_normals": broken,
             },
             hints=hints,
-            markers={
-                "faces_flipped": flipped_ids,
-                "edges_boundary": (
-                    mesh.vertices[mesh.edges_sorted[boundary_rows]]
-                    if boundary_edges
-                    else np.empty((0, 2, 3), dtype=np.float64)
-                ),
-            },
+            markers={"faces_flipped": flipped_ids},
         )
 
     def check_vertices(self) -> CheckResult:
@@ -355,6 +339,79 @@ class MeshAnalyzer:
             },
         )
 
+    def check_curvature(self) -> CheckResult:
+        mesh = self.welded
+        empty = np.empty(0, dtype=np.int64)
+        faces = int(len(mesh.faces))
+        pairs = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+        faceted_ids = empty
+        regions = 0
+        worst = 0.0
+        average = 0.0
+
+        if pairs.size and faces:
+            angles = np.degrees(np.asarray(mesh.face_adjacency_angles, dtype=np.float64))
+            bends = (angles >= self.FACET_ANGLE_MIN) & (angles <= self.FACET_ANGLE_MAX)
+            if np.any(bends):
+                touched = np.zeros(faces, dtype=bool)
+                touched[pairs[bends].reshape(-1)] = True
+                smooth = pairs[angles <= self.FACET_ANGLE_MAX]
+                graph = coo_matrix(
+                    (np.ones(len(smooth), dtype=np.int8), (smooth[:, 0], smooth[:, 1])),
+                    shape=(faces, faces),
+                )
+                _, labels = connected_components(graph, directed=False)
+                counts = np.bincount(labels[touched], minlength=int(labels.max()) + 1)
+                wanted = np.flatnonzero(counts >= self.FACET_REGION_MIN)
+                if wanted.size:
+                    keep = touched & np.isin(labels, wanted)
+                    faceted_ids = np.flatnonzero(keep)
+                    picked = angles[bends][keep[pairs[bends][:, 0]]]
+                    regions = int(wanted.size)
+                    worst = float(picked.max())
+                    average = float(picked.mean())
+
+        area = float(mesh.area)
+        share = (
+            float(mesh.area_faces[faceted_ids].sum() / area)
+            if faceted_ids.size and area > 0
+            else 0.0
+        )
+        penalty = (
+            min(22.0, share * 25.0 + average / self.FACET_ANGLE_MAX * 10.0) if regions else 0.0
+        )
+
+        hints: list[str] = []
+        if regions:
+            hints.append(
+                f"Плавные поверхности собраны из плоских кусков: излом в среднем {average:.0f}°, "
+                f"максимум {worst:.0f}°, задето {share * 100:.0f}% площади. Добавьте рёбер "
+                "на этих участках или примените Subdivision Surface"
+            )
+
+        return CheckResult(
+            code="curvature",
+            title="Нехватка полигонов на изгибах",
+            severity=self._severity(penalty),
+            penalty=penalty,
+            summary=(
+                f"{regions} угловатых зон, {faceted_ids.size} полигонов, "
+                f"средний излом {average:.0f}°"
+                if regions
+                else "резких изломов на плавных поверхностях нет"
+            ),
+            stats={
+                "faceted_regions": regions,
+                "faceted_faces": int(faceted_ids.size),
+                "area_percent": round(share * 100, 1),
+                "mean_angle": round(average, 1),
+                "max_angle": round(worst, 1),
+                "angle_window": [self.FACET_ANGLE_MIN, self.FACET_ANGLE_MAX],
+            },
+            hints=hints,
+            markers={"faces_faceted": faceted_ids},
+        )
+
     def _coplanar_redundancy(self) -> tuple[int, np.ndarray]:
         mesh = self.welded
         empty = np.empty(0, dtype=np.int64)
@@ -365,10 +422,8 @@ class MeshAnalyzer:
         for facet, boundary in zip(mesh.facets, mesh.facets_boundary):
             used = int(len(facet))
             minimal = max(self._boundary_corners(boundary) - 2, 1)
-            excess = used - minimal
-            if excess > 0:
-                total += excess
-            if excess >= self.MARK_MIN_EXCESS:
+            if used > minimal:
+                total += used - minimal
                 marked.append(np.asarray(facet, dtype=np.int64))
         return total, np.concatenate(marked) if marked else empty
 

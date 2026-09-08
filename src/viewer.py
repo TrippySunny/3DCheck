@@ -15,6 +15,7 @@ WIRE_COLOR = (0.20, 0.22, 0.26)
 
 FACE_LAYERS: dict[str, tuple[str, tuple[float, float, float]]] = {
     "faces_redundant": ("Лишние полигоны", (0.96, 0.82, 0.20)),
+    "faces_faceted": ("Нехватка полигонов", (0.42, 0.55, 1.00)),
     "faces_degenerate": ("Вырожденные полигоны", (1.00, 0.52, 0.10)),
     "faces_flipped": ("Вывернутые нормали", (0.94, 0.22, 0.24)),
 }
@@ -23,23 +24,12 @@ POINT_LAYERS: dict[str, tuple[str, tuple[float, float, float]]] = {
     "points_hotspots": ("Скопления вершин", (0.20, 0.95, 0.92)),
     "points_stray": ("Вершины вне полигонов", (1.00, 1.00, 1.00)),
 }
-EDGE_LAYERS: dict[str, tuple[str, tuple[float, float, float]]] = {
-    "edges_boundary": ("Открытые края", (0.25, 0.62, 1.00)),
-}
-LAYER_ORDER: list[str] = [
-    *FACE_LAYERS,
-    *EDGE_LAYERS,
-    *POINT_LAYERS,
-]
+LAYER_ORDER: list[str] = [*FACE_LAYERS, *POINT_LAYERS]
 LAYER_TITLES: dict[str, str] = {
-    key: value[0]
-    for group in (FACE_LAYERS, EDGE_LAYERS, POINT_LAYERS)
-    for key, value in group.items()
+    key: value[0] for group in (FACE_LAYERS, POINT_LAYERS) for key, value in group.items()
 }
 LAYER_COLORS: dict[str, tuple[float, float, float]] = {
-    key: value[1]
-    for group in (FACE_LAYERS, EDGE_LAYERS, POINT_LAYERS)
-    for key, value in group.items()
+    key: value[1] for group in (FACE_LAYERS, POINT_LAYERS) for key, value in group.items()
 }
 
 
@@ -57,7 +47,6 @@ class MeshViewer(OpenGLFrame):
         self._faces: np.ndarray | None = None
         self._markers: dict[str, np.ndarray] = {}
         self._points: dict[str, np.ndarray] = {}
-        self._edges: dict[str, np.ndarray] = {}
 
         self._center = np.zeros(3, dtype=np.float64)
         self._radius = 1.0
@@ -97,12 +86,6 @@ class MeshViewer(OpenGLFrame):
             key: np.asarray(self._markers.get(key, np.empty((0, 3))), dtype=np.float32)
             for key in POINT_LAYERS
         }
-        self._edges = {
-            key: np.asarray(
-                self._markers.get(key, np.empty((0, 2, 3))), dtype=np.float32
-            ).reshape(-1, 3)
-            for key in EDGE_LAYERS
-        }
 
         bounds = np.asarray(mesh.bounds, dtype=np.float64)
         self._center = bounds.mean(axis=0)
@@ -115,7 +98,6 @@ class MeshViewer(OpenGLFrame):
         self._normals = None
         self._colors = None
         self._points = {}
-        self._edges = {}
         self.refresh()
 
     def reset_view(self) -> None:
@@ -218,7 +200,6 @@ class MeshViewer(OpenGLFrame):
         GL.glTranslatef(*(-self._center))
 
         self._draw_surface()
-        self._draw_edges()
         self._draw_points()
 
     def _draw_surface(self) -> None:
@@ -244,20 +225,6 @@ class MeshViewer(OpenGLFrame):
             GL.glEnable(GL.GL_LIGHTING)
 
         GL.glDisableClientState(GL.GL_VERTEX_ARRAY)
-
-    def _draw_edges(self) -> None:
-        GL.glDisable(GL.GL_LIGHTING)
-        GL.glLineWidth(2.0)
-        GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
-        for key, points in self._edges.items():
-            if not self.visible.get(key, True) or len(points) == 0:
-                continue
-            GL.glColor3f(*LAYER_COLORS[key])
-            GL.glVertexPointer(3, GL.GL_FLOAT, 0, points)
-            GL.glDrawArrays(GL.GL_LINES, 0, len(points))
-        GL.glDisableClientState(GL.GL_VERTEX_ARRAY)
-        GL.glLineWidth(1.0)
-        GL.glEnable(GL.GL_LIGHTING)
 
     def _draw_points(self) -> None:
         GL.glDisable(GL.GL_LIGHTING)
