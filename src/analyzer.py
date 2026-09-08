@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import trimesh
@@ -81,7 +81,8 @@ class MeshAnalyzer:
     OVERDENSE_ANGLE: float = 8.0
     OVERDENSE_TARGET: float = 10.0
     OVERDENSE_REGION_MIN: int = 64
-    FACET_FACE_LIMIT: int = 400_000
+    FACET_FACE_LIMIT: int = 2_000_000
+    PLANAR_ANGLE_MAX: float = 0.2
     FACET_ANGLE_MIN: float = 38.0
     FACET_ANGLE_MAX: float = 65.0
     CREASE_LIST_MIN: float = 8.0
@@ -96,10 +97,20 @@ class MeshAnalyzer:
         (0.0, "grade.critical"),
     )
 
-    def __init__(self, path: str | Path, polygon_budget: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        polygon_budget: int | None = None,
+        mode: str = "strict",
+        progress: Callable[[float, str], None] | None = None,
+    ) -> None:
         self.path: Path = Path(path).expanduser().resolve()
+        self.mode: str = mode if mode in ("strict", "quality") else "strict"
         self.polygon_budget: int = int(polygon_budget or self.POLYGON_BUDGET)
+        self._progress = progress or (lambda _value, _key: None)
+        self._emit(0.04, "progress.read")
         self.raw: trimesh.Trimesh = self._load()
+        self._emit(0.22, "progress.prepare")
         self.shaded: trimesh.Trimesh = self.raw.copy()
         self.shaded.merge_vertices()
         self.welded: trimesh.Trimesh = self.raw.copy()
@@ -107,6 +118,10 @@ class MeshAnalyzer:
         self.scale: float = float(self.raw.scale) if self.raw.scale > 0 else 1.0
         self.weld_tolerance: float = max(self.scale * 1e-6, 1e-9)
         self.cluster_radius: float = self.scale * 1e-3
+        self._emit(0.38, "progress.prepare")
+
+    def _emit(self, value: float, key: str) -> None:
+        self._progress(float(np.clip(value, 0.0, 1.0)), key)
 
     def _load(self) -> trimesh.Trimesh:
         if not self.path.is_file():
@@ -125,16 +140,21 @@ class MeshAnalyzer:
         return loaded
 
     def analyze(self) -> AnalysisReport:
-        checks = [
-            self.check_polygons(),
-            self.check_density(),
-            self.check_normals(),
-            self.check_vertices(),
-            self.check_curvature(),
-        ]
+        self._emit(0.42, "progress.polygons")
+        checks = [self.check_polygons()]
+        self._emit(0.56, "progress.density")
+        checks.append(self.check_density())
+        self._emit(0.70, "progress.normals")
+        checks.append(self.check_normals())
+        self._emit(0.82, "progress.vertices")
+        checks.append(self.check_vertices())
+        self._emit(0.93, "progress.curvature")
+        checks.append(self.check_curvature())
         stats = self.summary()
+        stats["mode"] = self.mode
         stats.update(self._optimization(checks, stats))
         score = float(np.clip(100.0 - sum(check.penalty for check in checks), 0.0, 100.0))
+        self._emit(1.0, "progress.done")
         return AnalysisReport(
             source=self.path,
             score=score,
@@ -169,8 +189,10 @@ class MeshAnalyzer:
         redundant = int(polygons.stats.get("redundant_faces", 0) if polygons else 0)
         degenerate = int(polygons.stats.get("degenerate_faces", 0) if polygons else 0)
         excess = int(density.stats.get("excess_faces", 0) if density else 0)
+        if self.mode == "quality":
+            excess = 0
         budget = int(polygons.stats.get("budget", self.polygon_budget) if polygons else self.polygon_budget)
-        over_budget = max(faces - budget, 0)
+        over_budget = max(faces - budget, 0) if self.mode == "strict" else 0
         removable = min(faces, max(redundant + excess + degenerate, over_budget))
         keep = max(faces - removable, 0)
         percent = round(removable / faces * 100.0, 1) if faces else 0.0
@@ -203,7 +225,7 @@ class MeshAnalyzer:
         penalty = min(25.0, redundant_ratio * 60.0)
         if degenerate:
             penalty += min(15.0, 4.0 + degenerate / faces * 120.0)
-        if budget_ratio > 1.0:
+        if self.mode == "strict" and budget_ratio > 1.0:
             penalty += min(55.0, (budget_ratio - 1.0) * 18.0)
 
         hints: list[Message] = []
@@ -217,7 +239,7 @@ class MeshAnalyzer:
             )
         if degenerate:
             hints.append(msg("check.polygons.hint.degenerate", count=degenerate))
-        if budget_ratio > 1.0:
+        if self.mode == "strict" and budget_ratio > 1.0:
             hints.append(
                 msg(
                     "check.polygons.hint.budget",
@@ -265,26 +287,33 @@ class MeshAnalyzer:
             min(40.0, share * 32.0 + min(18.0, excess / max(faces, 1) * 40.0)) if regions else 0.0
         )
         hints: list[Message] = []
-        if regions:
+        if self.mode == "quality":
+            penalty = 0.0
+        elif regions:
             hints.append(msg("check.density.hint", mean=f"{average:.1f}"))
-        if faces >= self.ABSURD_FACE_MIN or overdense_ids.size >= self.ABSURD_SMOOTH_FACES:
+        if self.mode == "strict" and (
+            faces >= self.ABSURD_FACE_MIN or overdense_ids.size >= self.ABSURD_SMOOTH_FACES
+        ):
             hints.append(msg("check.polygons.hint.absurd"))
             penalty = max(penalty, 40.0)
+
+        if self.mode == "quality" and regions:
+            summary = msg("check.density.summary.quality", faces=int(overdense_ids.size))
+        elif regions:
+            summary = msg(
+                "check.density.summary.bad",
+                regions=regions,
+                faces=int(overdense_ids.size),
+                excess=excess,
+            )
+        else:
+            summary = msg("check.density.summary.ok")
 
         return CheckResult(
             code="density",
             severity=self._severity(penalty),
             penalty=penalty,
-            summary=(
-                msg(
-                    "check.density.summary.bad",
-                    regions=regions,
-                    faces=int(overdense_ids.size),
-                    excess=excess,
-                )
-                if regions
-                else msg("check.density.summary.ok")
-            ),
+            summary=summary,
             stats={
                 "overdense_regions": regions,
                 "overdense_faces": int(overdense_ids.size),
@@ -628,7 +657,8 @@ class MeshAnalyzer:
         return total, np.concatenate(marked) if marked else empty
 
     def _facet_is_planar(self, facet: np.ndarray) -> bool:
-        return self._region_is_planar(np.asarray(facet, dtype=np.int64))
+        ids = np.asarray(facet, dtype=np.int64)
+        return self._region_is_planar(ids) and self._region_is_zero_bend(ids)
 
     def _region_is_planar(self, face_ids: np.ndarray) -> bool:
         points = self.welded.vertices[np.unique(self.welded.faces[face_ids])]
@@ -636,7 +666,21 @@ class MeshAnalyzer:
             return True
         centered = points - points.mean(axis=0)
         singular = np.linalg.svd(centered, compute_uv=False)
-        return float(singular[-1] / (singular[0] + 1e-12)) <= 0.02
+        thickness = float(singular[-1])
+        return thickness <= max(self.scale * 1e-6, 1e-9)
+
+    def _region_is_zero_bend(self, face_ids: np.ndarray) -> bool:
+        mesh = self.welded
+        pairs = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+        if pairs.size == 0:
+            return True
+        lookup = np.zeros(int(len(mesh.faces)), dtype=bool)
+        lookup[face_ids] = True
+        inside = lookup[pairs[:, 0]] & lookup[pairs[:, 1]]
+        if not np.any(inside):
+            return True
+        angles = np.degrees(np.asarray(mesh.face_adjacency_angles, dtype=np.float64))
+        return float(np.max(angles[inside])) <= self.PLANAR_ANGLE_MAX
 
     def _declared_vertex_count(self) -> int | None:
         suffix = self.path.suffix.lower()

@@ -27,6 +27,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "LMB — rotate · RMB or Shift+LMB — pan · wheel — zoom · double click — reset",
     },
     "status.analyzing": {"ru": "Анализ {name} ...", "en": "Analyzing {name} ..."},
+    "progress.read": {"ru": "Чтение файла", "en": "Reading file"},
+    "progress.prepare": {"ru": "Подготовка сетки", "en": "Preparing mesh"},
+    "progress.polygons": {"ru": "Лишние полигоны", "en": "Excess polygons"},
+    "progress.density": {"ru": "Плотность сетки", "en": "Mesh density"},
+    "progress.normals": {"ru": "Нормали", "en": "Normals"},
+    "progress.vertices": {"ru": "Вершины", "en": "Vertices"},
+    "progress.curvature": {"ru": "Кривизна", "en": "Curvature"},
+    "progress.done": {"ru": "Готово", "en": "Done"},
     "status.ready": {
         "ru": "Готово · оценка {score}/100 · проблем: {problems}",
         "en": "Done · score {score}/100 · issues: {problems}",
@@ -93,6 +101,17 @@ STRINGS: dict[str, dict[str, str]] = {
     "settings.theme": {"ru": "Тема", "en": "Theme"},
     "settings.theme.dark": {"ru": "Тёмная", "en": "Dark"},
     "settings.theme.light": {"ru": "Светлая", "en": "Light"},
+    "settings.mode": {"ru": "Режим оценки", "en": "Scoring mode"},
+    "settings.mode.strict": {"ru": "Строгий", "en": "Strict"},
+    "settings.mode.quality": {"ru": "Высокое качество", "en": "High quality"},
+    "settings.mode.note": {
+        "ru": "Строгий — для игр и продакшена: лишний полигонаж штрафуется. "
+        "Высокое качество — детальная сетка считается намеренной, "
+        "оцениваются только дефекты геометрии.",
+        "en": "Strict is for games and production: extra polygons are penalized. "
+        "High quality treats dense tessellation as intentional and scores "
+        "geometry defects only.",
+    },
     "settings.xray": {"ru": "Показывать дефекты сквозь модель", "en": "Show defects through the model"},
     "settings.xray.note": {
         "ru": "Проблемные полигоны рисуются поверх геометрии, даже если спрятаны внутри модели",
@@ -150,6 +169,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "check.density.summary.ok": {
         "ru": "на гладких участках сетка не раздута",
         "en": "smooth areas are not over-tessellated",
+    },
+    "check.density.summary.quality": {
+        "ru": "плотная сетка ({faces} полигонов) — в режиме качества не штрафуется",
+        "en": "dense mesh ({faces} polygons) — not penalized in quality mode",
     },
     "check.density.summary.bad": {
         "ru": "{regions} гладких зон с избыточной сеткой, {faces} полигонов, можно убрать ~{excess}",

@@ -48,6 +48,7 @@ CANVAS_TUPLE = (CANVAS_COLORS["light"], CANVAS_COLORS["dark"])
 BAR_COLORS = {"dark": "#1A1E26", "light": PAPER}
 SIDE_COLORS = {"dark": "#1A1E26", "light": "#E8EDF3"}
 THEMES = ("dark", "light")
+MODES = ("strict", "quality")
 SECONDARY_BTN = {"fg_color": BLUE, "hover_color": BLUE_HOVER, "text_color": PAPER}
 TEXT_WRAP = 360
 
@@ -59,7 +60,7 @@ def settings_path() -> Path:
 
 def load_settings() -> dict[str, object]:
     path = settings_path()
-    data = {"language": FALLBACK, "theme": "dark", "xray": False}
+    data = {"language": FALLBACK, "theme": "dark", "xray": False, "mode": "strict"}
     if not path.is_file():
         return data
     try:
@@ -71,6 +72,8 @@ def load_settings() -> dict[str, object]:
     data["language"] = language if language in LANGUAGES else FALLBACK
     data["theme"] = theme if theme in THEMES else "dark"
     data["xray"] = bool(raw.get("xray", False))
+    mode = raw.get("mode", "strict")
+    data["mode"] = mode if mode in MODES else "strict"
     return data
 
 
@@ -158,6 +161,8 @@ class Application(ctk.CTk):
         self._shake_labels: list[ctk.CTkLabel] = []
         self._shake_after: str | None = None
         self._persist_job: str | None = None
+        self._locale_dirty = False
+        self._source_path: Path | None = None
         self.icon_path: Path | None = None
         self.on_report_ready: Callable[[AnalysisReport], None] | None = None
         self._apply_icon()
@@ -169,6 +174,7 @@ class Application(ctk.CTk):
         self._build_body()
         self._build_statusbar()
         self.viewer.set_xray(bool(self.settings["xray"]))
+        self._veil = ctk.CTkFrame(self, corner_radius=0, fg_color=(BAR_COLORS["light"], BAR_COLORS["dark"]))
         self.after(80, close_splash)
 
     def _apply_icon(self) -> None:
@@ -208,13 +214,13 @@ class Application(ctk.CTk):
                     pass
 
     def _build_toolbar(self) -> None:
-        bar = ctk.CTkFrame(self, corner_radius=0, height=72, fg_color=(BAR_COLORS["light"], BAR_COLORS["dark"]))
+        bar = ctk.CTkFrame(self, corner_radius=0, height=84, fg_color=(BAR_COLORS["light"], BAR_COLORS["dark"]))
         bar.grid(row=0, column=0, columnspan=2, sticky="ew")
         bar.grid_columnconfigure(2, weight=1)
 
         if self._logo_image is not None:
             ctk.CTkLabel(bar, text="", image=self._logo_image).grid(
-                row=0, column=0, padx=(16, 8), pady=14
+                row=0, column=0, padx=(16, 8), pady=14, rowspan=2
             )
         self._btn_open = ctk.CTkButton(
             bar,
@@ -224,16 +230,23 @@ class Application(ctk.CTk):
             font=ctk.CTkFont(size=14, weight="bold"),
             command=self.open_file,
         )
-        self._btn_open.grid(row=0, column=1, padx=(6, 10), pady=14)
+        self._btn_open.grid(row=0, column=1, padx=(6, 10), pady=(12, 4), rowspan=2)
+        file_box = ctk.CTkFrame(bar, fg_color="transparent")
+        file_box.grid(row=0, column=2, sticky="ew", padx=8, pady=10, rowspan=2)
+        file_box.grid_columnconfigure(0, weight=1)
         self.file_label = ctk.CTkLabel(
-            bar, text=self.t("file.none"), anchor="w", text_color=MUTED
+            file_box, text=self.t("file.none"), anchor="w", text_color=MUTED
         )
-        self.file_label.grid(row=0, column=2, sticky="ew", padx=8)
-
+        self.file_label.grid(row=0, column=0, sticky="ew")
+        self._progress = ctk.CTkProgressBar(file_box, height=8, progress_color=BLUE)
+        self._progress.set(0)
+        self._progress_label = ctk.CTkLabel(
+            file_box, text="", anchor="w", text_color=MUTED, font=ctk.CTkFont(size=11)
+        )
         self.wireframe_switch = ctk.CTkSwitch(
             bar, text=self.t("toolbar.wireframe"), command=self._on_wireframe, width=90
         )
-        self.wireframe_switch.grid(row=0, column=3, padx=10)
+        self.wireframe_switch.grid(row=0, column=3, padx=10, rowspan=2)
         self._btn_reset = ctk.CTkButton(
             bar,
             text=self.t("toolbar.reset"),
@@ -242,7 +255,7 @@ class Application(ctk.CTk):
             command=self._on_reset,
             **SECONDARY_BTN,
         )
-        self._btn_reset.grid(row=0, column=4, padx=6)
+        self._btn_reset.grid(row=0, column=4, padx=6, rowspan=2)
         self._btn_shot = ctk.CTkButton(
             bar,
             text=self.t("toolbar.screenshot"),
@@ -251,7 +264,7 @@ class Application(ctk.CTk):
             command=self._on_screenshot,
             **SECONDARY_BTN,
         )
-        self._btn_shot.grid(row=0, column=5, padx=6)
+        self._btn_shot.grid(row=0, column=5, padx=6, rowspan=2)
         self._btn_settings = ctk.CTkButton(
             bar,
             text=self.t("toolbar.settings"),
@@ -260,7 +273,7 @@ class Application(ctk.CTk):
             command=self._toggle_app_settings,
             **SECONDARY_BTN,
         )
-        self._btn_settings.grid(row=0, column=6, padx=(6, 16))
+        self._btn_settings.grid(row=0, column=6, padx=(6, 16), rowspan=2)
 
     def _build_body(self) -> None:
         self._canvas_holder = ctk.CTkFrame(self, corner_radius=24, fg_color=CANVAS_TUPLE)
@@ -285,16 +298,27 @@ class Application(ctk.CTk):
         self._side.grid_columnconfigure(0, weight=1)
         self._side.grid_rowconfigure(1, weight=1)
 
-        self._tab_switch = ctk.CTkSegmentedButton(
-            self._side,
-            values=[self.t("tab.report"), self.t("tab.params")],
-            command=self._on_tab_label,
-            dynamic_resizing=False,
+        self._tab_bar = ctk.CTkFrame(self._side, fg_color="transparent")
+        self._tab_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        self._tab_bar.grid_columnconfigure((0, 1), weight=1)
+        tab_font = ctk.CTkFont(size=13)
+        self._tab_report = ctk.CTkButton(
+            self._tab_bar,
+            text=self.t("tab.report"),
             height=36,
-            font=ctk.CTkFont(size=13),
+            font=tab_font,
+            command=lambda: self._show_tab("report"),
         )
-        self._tab_switch.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
-        self._tab_switch.set(self.t("tab.report"))
+        self._tab_report.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._tab_params = ctk.CTkButton(
+            self._tab_bar,
+            text=self.t("tab.params"),
+            height=36,
+            font=tab_font,
+            command=lambda: self._show_tab("params"),
+        )
+        self._tab_params.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self._paint_tabs()
 
         self.sidebar = ctk.CTkScrollableFrame(
             self._side, corner_radius=0, fg_color="transparent"
@@ -327,13 +351,10 @@ class Application(ctk.CTk):
 
     def _build_params(self) -> None:
         panel = self._params_panel
-        for child in panel.winfo_children():
-            child.destroy()
-
         card = ctk.CTkFrame(panel, corner_radius=24, fg_color=CARD)
         card.grid(row=0, column=0, sticky="ew", padx=10, pady=12)
         card.grid_columnconfigure(0, weight=1)
-        title = ctk.CTkLabel(
+        self._params_title = ctk.CTkLabel(
             card,
             text=self.t("params.title"),
             font=ctk.CTkFont(size=20, weight="bold"),
@@ -341,10 +362,9 @@ class Application(ctk.CTk):
             justify="left",
             wraplength=TEXT_WRAP,
         )
-        title.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 4))
-        ctk.CTkLabel(card, text=self.t("params.display"), text_color=MUTED).grid(
-            row=1, column=0, sticky="w", padx=20, pady=(4, 8)
-        )
+        self._params_title.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 4))
+        self._params_display = ctk.CTkLabel(card, text=self.t("params.display"), text_color=MUTED)
+        self._params_display.grid(row=1, column=0, sticky="w", padx=20, pady=(4, 8))
         self._settings_xray = ctk.CTkSwitch(
             card, text=self.t("settings.xray"), command=self._on_xray_switch, font=ctk.CTkFont(size=13)
         )
@@ -353,7 +373,7 @@ class Application(ctk.CTk):
         else:
             self._settings_xray.deselect()
         self._settings_xray.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 4))
-        note = ctk.CTkLabel(
+        self._params_note = ctk.CTkLabel(
             card,
             text=self.t("settings.xray.note"),
             justify="left",
@@ -361,84 +381,164 @@ class Application(ctk.CTk):
             wraplength=TEXT_WRAP,
             text_color=MUTED,
         )
-        note.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
+        self._params_note.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
+
+    def _sync_params(self) -> None:
+        self._params_title.configure(text=self.t("params.title"))
+        self._params_display.configure(text=self.t("params.display"))
+        self._settings_xray.configure(text=self.t("settings.xray"))
+        self._params_note.configure(text=self.t("settings.xray.note"))
 
     def _build_app_overlay(self) -> None:
-        self._overlay = ctk.CTkFrame(self._canvas_holder, fg_color=("#1A1E26", "#1A1E26"), corner_radius=24)
-        self._overlay_card = ctk.CTkFrame(self._overlay, width=400, corner_radius=28, fg_color=CARD)
+        self._overlay = ctk.CTkFrame(
+            self._canvas_holder, fg_color=("#C8D0DA", "#0A0D12"), corner_radius=24
+        )
+        self._overlay_card = ctk.CTkFrame(self._overlay, width=420, corner_radius=28, fg_color=CARD)
         self._overlay_card.place(relx=0.5, rely=0.5, anchor="center")
         self._overlay_card.grid_columnconfigure(0, weight=1)
         self._overlay.bind("<Button-1>", lambda _event: self._hide_app_settings())
-        self._fill_app_overlay()
-
-    def _fill_app_overlay(self) -> None:
         card = self._overlay_card
-        for child in card.winfo_children():
-            child.destroy()
-
-        ctk.CTkLabel(
+        self._overlay_title = ctk.CTkLabel(
             card,
             text=self.t("settings.title"),
             font=ctk.CTkFont(size=24, weight="bold"),
             text_color=(INK, PAPER),
-        ).grid(row=0, column=0, sticky="w", padx=24, pady=(22, 14))
-
-        ctk.CTkLabel(card, text=self.t("settings.language")).grid(
-            row=1, column=0, sticky="w", padx=24, pady=(4, 4)
         )
+        self._overlay_title.grid(row=0, column=0, sticky="w", padx=24, pady=(22, 14))
+        self._overlay_lang_label = ctk.CTkLabel(card, text=self.t("settings.language"))
+        self._overlay_lang_label.grid(row=1, column=0, sticky="w", padx=24, pady=(4, 4))
         self._settings_language = ctk.CTkOptionMenu(
             card,
             values=[LANGUAGE_NAMES[code] for code in LANGUAGES],
-            width=240,
+            width=260,
         )
         self._settings_language.set(LANGUAGE_NAMES[str(self.settings["language"])])
         self._settings_language.configure(command=self._on_language)
         self._settings_language.grid(row=2, column=0, sticky="w", padx=24)
-
-        ctk.CTkLabel(card, text=self.t("settings.theme")).grid(
-            row=3, column=0, sticky="w", padx=24, pady=(16, 4)
+        self._overlay_theme_label = ctk.CTkLabel(card, text=self.t("settings.theme"))
+        self._overlay_theme_label.grid(row=3, column=0, sticky="w", padx=24, pady=(16, 4))
+        theme_row = ctk.CTkFrame(card, fg_color="transparent")
+        theme_row.grid(row=4, column=0, sticky="ew", padx=24)
+        theme_row.grid_columnconfigure((0, 1), weight=1)
+        self._theme_dark = ctk.CTkButton(
+            theme_row,
+            text=self.t("settings.theme.dark"),
+            height=36,
+            command=lambda: self._on_theme_pick("dark"),
         )
-        self._settings_theme = ctk.CTkOptionMenu(
+        self._theme_dark.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._theme_light = ctk.CTkButton(
+            theme_row,
+            text=self.t("settings.theme.light"),
+            height=36,
+            command=lambda: self._on_theme_pick("light"),
+        )
+        self._theme_light.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self._overlay_mode_label = ctk.CTkLabel(card, text=self.t("settings.mode"))
+        self._overlay_mode_label.grid(row=5, column=0, sticky="w", padx=24, pady=(16, 4))
+        mode_row = ctk.CTkFrame(card, fg_color="transparent")
+        mode_row.grid(row=6, column=0, sticky="ew", padx=24)
+        mode_row.grid_columnconfigure((0, 1), weight=1)
+        self._mode_strict = ctk.CTkButton(
+            mode_row,
+            text=self.t("settings.mode.strict"),
+            height=36,
+            command=lambda: self._on_mode_pick("strict"),
+        )
+        self._mode_strict.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._mode_quality = ctk.CTkButton(
+            mode_row,
+            text=self.t("settings.mode.quality"),
+            height=36,
+            command=lambda: self._on_mode_pick("quality"),
+        )
+        self._mode_quality.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self._overlay_mode_note = ctk.CTkLabel(
             card,
-            values=[self.t("settings.theme.dark"), self.t("settings.theme.light")],
-            width=240,
+            text=self.t("settings.mode.note"),
+            justify="left",
+            anchor="w",
+            wraplength=TEXT_WRAP,
+            text_color=MUTED,
+            font=ctk.CTkFont(size=12),
         )
-        self._settings_theme.set(self.t(f"settings.theme.{self.settings['theme']}"))
-        self._settings_theme.configure(command=self._on_theme_label)
-        self._settings_theme.grid(row=4, column=0, sticky="w", padx=24)
-
+        self._overlay_mode_note.grid(row=7, column=0, sticky="ew", padx=24, pady=(8, 0))
         self._overlay_close = ctk.CTkButton(
             card, text=self.t("settings.close"), width=120, command=self._hide_app_settings
         )
-        self._overlay_close.grid(row=5, column=0, sticky="e", padx=24, pady=22)
+        self._overlay_close.grid(row=8, column=0, sticky="e", padx=24, pady=22)
+        self._paint_theme_buttons()
+        self._paint_mode_buttons()
+
+    def _sync_overlay(self) -> None:
+        self._overlay_title.configure(text=self.t("settings.title"))
+        self._overlay_lang_label.configure(text=self.t("settings.language"))
+        self._overlay_theme_label.configure(text=self.t("settings.theme"))
+        self._theme_dark.configure(text=self.t("settings.theme.dark"))
+        self._theme_light.configure(text=self.t("settings.theme.light"))
+        self._overlay_mode_label.configure(text=self.t("settings.mode"))
+        self._mode_strict.configure(text=self.t("settings.mode.strict"))
+        self._mode_quality.configure(text=self.t("settings.mode.quality"))
+        self._overlay_mode_note.configure(text=self.t("settings.mode.note"))
+        self._overlay_close.configure(text=self.t("settings.close"))
+        current = LANGUAGE_NAMES[str(self.settings["language"])]
+        if self._settings_language.get() != current:
+            self._settings_language.configure(command=lambda _value: None)
+            self._settings_language.set(current)
+            self._settings_language.configure(command=self._on_language)
+        self._paint_theme_buttons()
+        self._paint_mode_buttons()
+
+    def _paint_theme_buttons(self) -> None:
+        chosen = str(self.settings["theme"])
+        on_style = {"fg_color": BLUE, "hover_color": BLUE_HOVER, "text_color": PAPER}
+        off_style = {"fg_color": ("#D8DEE8", "#2A303A"), "hover_color": ("#C9D1DE", "#353C48"), "text_color": (INK, PAPER)}
+        self._theme_dark.configure(**(on_style if chosen == "dark" else off_style))
+        self._theme_light.configure(**(on_style if chosen == "light" else off_style))
+
+    def _paint_mode_buttons(self) -> None:
+        chosen = str(self.settings.get("mode", "strict"))
+        on_style = {"fg_color": BLUE, "hover_color": BLUE_HOVER, "text_color": PAPER}
+        off_style = {"fg_color": ("#D8DEE8", "#2A303A"), "hover_color": ("#C9D1DE", "#353C48"), "text_color": (INK, PAPER)}
+        self._mode_strict.configure(**(on_style if chosen == "strict" else off_style))
+        self._mode_quality.configure(**(on_style if chosen == "quality" else off_style))
+
+    def _paint_tabs(self) -> None:
+        on_style = {"fg_color": BLUE, "hover_color": BLUE_HOVER, "text_color": PAPER}
+        off_style = {"fg_color": ("#D8DEE8", "#2A303A"), "hover_color": ("#C9D1DE", "#353C48"), "text_color": (INK, PAPER)}
+        self._tab_report.configure(
+            text=self.t("tab.report"),
+            **(on_style if self._active_tab == "report" else off_style),
+        )
+        self._tab_params.configure(
+            text=self.t("tab.params"),
+            **(on_style if self._active_tab == "params" else off_style),
+        )
 
     def _toggle_app_settings(self) -> None:
         if self._overlay.winfo_ismapped():
             self._hide_app_settings()
             return
-        self._fill_app_overlay()
+        self._sync_overlay()
         self._overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._overlay.lift()
 
     def _hide_app_settings(self) -> None:
         self._overlay.place_forget()
-
-    def _on_tab_label(self, label: str) -> None:
-        chosen = "params" if label == self.t("tab.params") else "report"
-        if chosen != self._active_tab:
-            self._show_tab(chosen)
+        if self._locale_dirty:
+            self._locale_dirty = False
+            self._relocalize_report()
 
     def _show_tab(self, name: str) -> None:
-        self._active_tab = name
-        if name == "params":
-            self.sidebar.grid_remove()
-            self._params_panel.grid(row=1, column=0, sticky="nsew")
-        else:
-            self._params_panel.grid_remove()
-            self.sidebar.grid(row=1, column=0, sticky="nsew")
-        wanted = self.t("tab.params") if name == "params" else self.t("tab.report")
-        if self._tab_switch.get() != wanted:
-            self._tab_switch.set(wanted)
+        if name != self._active_tab:
+            self._active_tab = name
+            if name == "params":
+                self.sidebar.grid_remove()
+                self._params_panel.grid(row=1, column=0, sticky="nsew")
+            else:
+                self._params_panel.grid_remove()
+                self.sidebar.grid(row=1, column=0, sticky="nsew")
+        self._paint_tabs()
 
     def _add_absurd_label(self, card: ctk.CTkFrame, row: int) -> None:
         holder = ctk.CTkFrame(card, fg_color="transparent", height=86)
@@ -511,8 +611,10 @@ class Application(ctk.CTk):
             self.load(Path(path))
 
     def load(self, path: Path) -> None:
+        self._source_path = path
         self.file_label.configure(text=str(path))
         self.status.configure(text=self.t("status.analyzing", name=path.name))
+        self._set_progress(0.02, "progress.read")
         self._clear_sidebar()
         card = ctk.CTkFrame(self.sidebar, corner_radius=24, fg_color=CARD)
         card.grid(row=0, column=0, sticky="ew", padx=8, pady=12)
@@ -523,36 +625,65 @@ class Application(ctk.CTk):
             text_color=BLUE,
         ).grid(row=0, column=0, sticky="w", padx=22, pady=24)
         threading.Thread(target=self._worker, args=(path,), daemon=True).start()
-        self.after(60, self._poll)
+        self.after(40, self._poll)
 
     def _worker(self, path: Path) -> None:
+        def progress(value: float, key: str) -> None:
+            self._queue.put(("progress", (value, key)))
+
         try:
-            self._queue.put(("ok", MeshAnalyzer(path).analyze()))
+            report = MeshAnalyzer(
+                path,
+                mode=str(self.settings.get("mode", "strict")),
+                progress=progress,
+            ).analyze()
+            self._queue.put(("ok", report))
         except Exception as error:
             self._queue.put(("error", error))
 
     def _poll(self) -> None:
         try:
-            kind, payload = self._queue.get_nowait()
+            while True:
+                kind, payload = self._queue.get_nowait()
+                if kind == "progress":
+                    value, key = payload
+                    self._set_progress(float(value), str(key))
+                elif kind == "error":
+                    self._hide_progress()
+                    self._show_error(payload)
+                    return
+                else:
+                    self._set_progress(1.0, "progress.done")
+                    self._report = payload
+                    self._source_path = payload.source
+                    self.viewer.set_mesh(payload.mesh, payload.markers)
+                    self._show_tab("report")
+                    self._render_report(payload)
+                    self.status.configure(
+                        text=self.t(
+                            "status.ready",
+                            score=f"{payload.score:.0f}",
+                            problems=len(payload.problems),
+                        )
+                    )
+                    if self.on_report_ready is not None:
+                        self.on_report_ready(payload)
+                    self.after(400, self._hide_progress)
+                    return
         except queue.Empty:
-            self.after(60, self._poll)
-            return
-        if kind == "error":
-            self._show_error(payload)
-            return
-        self._report = payload
-        self.viewer.set_mesh(payload.mesh, payload.markers)
-        self._show_tab("report")
-        self._render_report(payload)
-        self.status.configure(
-            text=self.t(
-                "status.ready",
-                score=f"{payload.score:.0f}",
-                problems=len(payload.problems),
-            )
-        )
-        if self.on_report_ready is not None:
-            self.on_report_ready(payload)
+            self.after(40, self._poll)
+
+    def _set_progress(self, value: float, key: str) -> None:
+        if not self._progress.winfo_ismapped():
+            self._progress.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+            self._progress_label.grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        self._progress.set(max(0.0, min(value, 1.0)))
+        self._progress_label.configure(text=self.t(key))
+
+    def _hide_progress(self) -> None:
+        self._progress.grid_remove()
+        self._progress_label.grid_remove()
+        self._progress.set(0)
 
     def _error_text(self, error: object) -> str:
         if isinstance(error, AnalyzerError):
@@ -784,30 +915,54 @@ class Application(ctk.CTk):
 
     def _on_language(self, name: str) -> None:
         reverse = {title: code for code, title in LANGUAGE_NAMES.items()}
-        self.settings["language"] = reverse.get(name, FALLBACK)
-        self.t.set_language(str(self.settings["language"]))
+        chosen = reverse.get(name, FALLBACK)
+        if chosen == self.settings.get("language"):
+            return
+        self.settings["language"] = chosen
+        self.t.set_language(chosen)
         self._schedule_persist()
         self._relocalize()
 
-    def _on_theme_label(self, label: str) -> None:
-        self._apply_theme("light" if label == self.t("settings.theme.light") else "dark")
+    def _on_theme_pick(self, theme: str) -> None:
+        self._apply_theme(theme)
+        self._paint_theme_buttons()
 
     def _apply_theme(self, theme: str) -> None:
         chosen = theme if theme in THEMES else "dark"
         if chosen == self.settings.get("theme"):
             return
         self.settings["theme"] = chosen
+        self._paint_theme_buttons()
+        color = BAR_COLORS[chosen]
+        self._veil.configure(fg_color=color)
+        self._veil.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._veil.lift()
         self.after(1, lambda: self._commit_theme(chosen))
 
     def _commit_theme(self, chosen: str) -> None:
         if str(self.settings.get("theme")) != chosen:
+            self._drop_veil()
             return
         ctk.set_appearance_mode(chosen)
-        self.after_idle(self._finish_theme)
-
-    def _finish_theme(self) -> None:
-        self.viewer.set_theme(str(self.settings["theme"]))
+        self.viewer.set_theme(chosen)
         self._schedule_persist()
+        self.update_idletasks()
+        self.after(40, self._drop_veil)
+
+    def _drop_veil(self) -> None:
+        self._veil.place_forget()
+        if self._overlay.winfo_ismapped():
+            self._overlay.lift()
+
+    def _on_mode_pick(self, mode: str) -> None:
+        chosen = mode if mode in MODES else "strict"
+        if chosen == self.settings.get("mode"):
+            return
+        self.settings["mode"] = chosen
+        self._paint_mode_buttons()
+        self._schedule_persist()
+        if self._source_path is not None:
+            self.load(self._source_path)
 
     def _on_xray_switch(self) -> None:
         state = bool(self._settings_xray.get())
@@ -822,23 +977,30 @@ class Application(ctk.CTk):
         self._btn_shot.configure(text=self.t("toolbar.screenshot"))
         self._btn_settings.configure(text=self.t("toolbar.settings"))
         self.wireframe_switch.configure(text=self.t("toolbar.wireframe"))
-        self._tab_switch.configure(values=[self.t("tab.report"), self.t("tab.params")])
-        self._build_params()
-        self._fill_app_overlay()
+        self._sync_overlay()
+        self._sync_params()
+        self._paint_tabs()
+        if self._overlay.winfo_ismapped():
+            self._locale_dirty = True
+            return
+        self.after_idle(self._relocalize_report)
+
+    def _relocalize_report(self) -> None:
+        none = {Translator(code)("file.none") for code in LANGUAGES}
         if self._report is None:
-            self.file_label.configure(text=self.t("file.none"))
-            self.status.configure(text=self.t("status.controls"))
+            if str(self.file_label.cget("text")) in none:
+                self.file_label.configure(text=self.t("file.none"))
+                self.status.configure(text=self.t("status.controls"))
             self._show_placeholder()
-        else:
-            self._render_report(self._report)
-            self.status.configure(
-                text=self.t(
-                    "status.ready",
-                    score=f"{self._report.score:.0f}",
-                    problems=len(self._report.problems),
-                )
+            return
+        self._render_report(self._report)
+        self.status.configure(
+            text=self.t(
+                "status.ready",
+                score=f"{self._report.score:.0f}",
+                problems=len(self._report.problems),
             )
-        self._show_tab(self._active_tab)
+        )
 
     def _on_layer(self, key: str) -> None:
         box = self._toggles.get(key)
