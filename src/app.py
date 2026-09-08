@@ -7,12 +7,13 @@ import random
 import sys
 import threading
 import tkinter as tk
+from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog
 from typing import Callable
 
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageDraw, ImageTk
 
 try:
     from analyzer import CRITICAL, OK, WARNING, AnalysisReport, AnalyzerError, MeshAnalyzer
@@ -42,11 +43,13 @@ SEVERITY_CARD = {
     WARNING: ("#FFF6D6", "#332A10"),
     CRITICAL: ("#FFE4E4", "#3A1414"),
 }
-CANVAS_COLORS = {"dark": "#1A1E26", "light": "#E8EDF3"}
+CANVAS_COLORS = {"dark": "#0A0D12", "light": "#B8C2D0"}
+CANVAS_TUPLE = (CANVAS_COLORS["light"], CANVAS_COLORS["dark"])
 BAR_COLORS = {"dark": "#1A1E26", "light": PAPER}
 SIDE_COLORS = {"dark": "#1A1E26", "light": "#E8EDF3"}
 THEMES = ("dark", "light")
 SECONDARY_BTN = {"fg_color": BLUE, "hover_color": BLUE_HOVER, "text_color": PAPER}
+TEXT_WRAP = 360
 
 
 def settings_path() -> Path:
@@ -97,6 +100,33 @@ def score_track_color(score: float) -> str:
     return "#8A1F1F"
 
 
+def format_bytes(translator: Translator, value: int) -> str:
+    amount = max(int(value), 0)
+    if amount < 1024:
+        return translator("size.bytes", value=amount)
+    if amount < 1024 * 1024:
+        return translator("size.kb", value=f"{amount / 1024:.1f}")
+    return translator("size.mb", value=f"{amount / (1024 * 1024):.2f}")
+
+
+def round_corners(source: Image.Image, size: int, radius_ratio: float = 0.22) -> Image.Image:
+    picture = source.convert("RGBA").resize((size, size), Image.Resampling.NEAREST)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, size - 1, size - 1),
+        radius=max(int(size * radius_ratio), 1),
+        fill=255,
+    )
+    picture.putalpha(mask)
+    return picture
+
+
+def _png_bytes(image: Image.Image) -> bytes:
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def close_splash() -> None:
     try:
         import pyi_splash
@@ -114,7 +144,7 @@ class Application(ctk.CTk):
             ctk.set_default_color_theme(str(THEME_FILE))
         ctk.set_appearance_mode(str(self.settings["theme"]))
         super().__init__()
-        self.configure(fg_color=(CANVAS_COLORS["light"], CANVAS_COLORS["dark"]))
+        self.configure(fg_color=CANVAS_TUPLE)
         self.title(self.t("app.title"))
         self.geometry("1360x820")
         self.minsize(1040, 640)
@@ -122,11 +152,12 @@ class Application(ctk.CTk):
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._report: AnalysisReport | None = None
         self._toggles: dict[str, ctk.CTkCheckBox] = {}
-        self._icon_image: tk.PhotoImage | None = None
+        self._icon_image: ImageTk.PhotoImage | tk.PhotoImage | None = None
         self._logo_image: ctk.CTkImage | None = None
         self._active_tab: str = "report"
         self._shake_labels: list[ctk.CTkLabel] = []
         self._shake_after: str | None = None
+        self._persist_job: str | None = None
         self.icon_path: Path | None = None
         self.on_report_ready: Callable[[AnalysisReport], None] | None = None
         self._apply_icon()
@@ -137,11 +168,23 @@ class Application(ctk.CTk):
         self._build_toolbar()
         self._build_body()
         self._build_statusbar()
-        self.viewer.set_theme(str(self.settings["theme"]))
         self.viewer.set_xray(bool(self.settings["xray"]))
         self.after(80, close_splash)
 
     def _apply_icon(self) -> None:
+        source = ASSETS / "logo_256.png"
+        rounded = None
+        if source.is_file():
+            try:
+                rounded = round_corners(Image.open(source), 256)
+                self._logo_image = ctk.CTkImage(
+                    light_image=round_corners(Image.open(source), 72),
+                    dark_image=round_corners(Image.open(source), 72),
+                    size=(36, 36),
+                )
+            except OSError:
+                rounded = None
+                self._logo_image = None
         icon = ASSETS / "logo.ico"
         if icon.is_file():
             try:
@@ -149,20 +192,20 @@ class Application(ctk.CTk):
                 self.icon_path = icon
             except tk.TclError:
                 pass
-        fallback = ASSETS / "logo_256.png"
-        if fallback.is_file():
+        if rounded is not None:
             try:
-                picture = Image.open(fallback)
-                self._logo_image = ctk.CTkImage(light_image=picture, dark_image=picture, size=(36, 36))
-            except OSError:
-                self._logo_image = None
-        if self.icon_path is None and fallback.is_file():
-            try:
-                self._icon_image = tk.PhotoImage(file=str(fallback))
+                self._icon_image = ImageTk.PhotoImage(rounded)
                 self.iconphoto(True, self._icon_image)
-                self.icon_path = fallback
+                if self.icon_path is None:
+                    self.icon_path = source
             except tk.TclError:
-                pass
+                try:
+                    self._icon_image = tk.PhotoImage(data=_png_bytes(rounded))
+                    self.iconphoto(True, self._icon_image)
+                    if self.icon_path is None:
+                        self.icon_path = source
+                except tk.TclError:
+                    pass
 
     def _build_toolbar(self) -> None:
         bar = ctk.CTkFrame(self, corner_radius=0, height=72, fg_color=(BAR_COLORS["light"], BAR_COLORS["dark"]))
@@ -220,9 +263,7 @@ class Application(ctk.CTk):
         self._btn_settings.grid(row=0, column=6, padx=(6, 16))
 
     def _build_body(self) -> None:
-        self._canvas_holder = ctk.CTkFrame(
-            self, corner_radius=24, fg_color=CANVAS_COLORS[str(self.settings["theme"])]
-        )
+        self._canvas_holder = ctk.CTkFrame(self, corner_radius=24, fg_color=CANVAS_TUPLE)
         self._canvas_holder.grid(row=1, column=0, sticky="nsew", padx=(10, 8), pady=4)
         self._canvas_holder.grid_rowconfigure(0, weight=1)
         self._canvas_holder.grid_columnconfigure(0, weight=1)
@@ -237,7 +278,7 @@ class Application(ctk.CTk):
         self._build_app_overlay()
 
         self._side = ctk.CTkFrame(
-            self, width=420, corner_radius=0, fg_color=(SIDE_COLORS["light"], SIDE_COLORS["dark"])
+            self, width=448, corner_radius=0, fg_color=(SIDE_COLORS["light"], SIDE_COLORS["dark"])
         )
         self._side.grid(row=1, column=1, sticky="nsew", padx=(0, 8))
         self._side.grid_propagate(False)
@@ -248,6 +289,9 @@ class Application(ctk.CTk):
             self._side,
             values=[self.t("tab.report"), self.t("tab.params")],
             command=self._on_tab_label,
+            dynamic_resizing=False,
+            height=36,
+            font=ctk.CTkFont(size=13),
         )
         self._tab_switch.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
         self._tab_switch.set(self.t("tab.report"))
@@ -289,27 +333,35 @@ class Application(ctk.CTk):
         card = ctk.CTkFrame(panel, corner_radius=24, fg_color=CARD)
         card.grid(row=0, column=0, sticky="ew", padx=10, pady=12)
         card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            card, text=self.t("params.title"), font=ctk.CTkFont(size=22, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 4))
+        title = ctk.CTkLabel(
+            card,
+            text=self.t("params.title"),
+            font=ctk.CTkFont(size=20, weight="bold"),
+            anchor="w",
+            justify="left",
+            wraplength=TEXT_WRAP,
+        )
+        title.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 4))
         ctk.CTkLabel(card, text=self.t("params.display"), text_color=MUTED).grid(
             row=1, column=0, sticky="w", padx=20, pady=(4, 8)
         )
         self._settings_xray = ctk.CTkSwitch(
-            card, text=self.t("settings.xray"), command=self._on_xray_switch
+            card, text=self.t("settings.xray"), command=self._on_xray_switch, font=ctk.CTkFont(size=13)
         )
         if self.settings["xray"]:
             self._settings_xray.select()
         else:
             self._settings_xray.deselect()
         self._settings_xray.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 4))
-        ctk.CTkLabel(
+        note = ctk.CTkLabel(
             card,
             text=self.t("settings.xray.note"),
             justify="left",
-            wraplength=320,
+            anchor="w",
+            wraplength=TEXT_WRAP,
             text_color=MUTED,
-        ).grid(row=3, column=0, sticky="w", padx=20, pady=(0, 20))
+        )
+        note.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
 
     def _build_app_overlay(self) -> None:
         self._overlay = ctk.CTkFrame(self._canvas_holder, fg_color=("#1A1E26", "#1A1E26"), corner_radius=24)
@@ -337,10 +389,10 @@ class Application(ctk.CTk):
         self._settings_language = ctk.CTkOptionMenu(
             card,
             values=[LANGUAGE_NAMES[code] for code in LANGUAGES],
-            command=self._on_language,
             width=240,
         )
         self._settings_language.set(LANGUAGE_NAMES[str(self.settings["language"])])
+        self._settings_language.configure(command=self._on_language)
         self._settings_language.grid(row=2, column=0, sticky="w", padx=24)
 
         ctk.CTkLabel(card, text=self.t("settings.theme")).grid(
@@ -349,10 +401,10 @@ class Application(ctk.CTk):
         self._settings_theme = ctk.CTkOptionMenu(
             card,
             values=[self.t("settings.theme.dark"), self.t("settings.theme.light")],
-            command=self._on_theme_label,
             width=240,
         )
         self._settings_theme.set(self.t(f"settings.theme.{self.settings['theme']}"))
+        self._settings_theme.configure(command=self._on_theme_label)
         self._settings_theme.grid(row=4, column=0, sticky="w", padx=24)
 
         self._overlay_close = ctk.CTkButton(
@@ -372,18 +424,21 @@ class Application(ctk.CTk):
         self._overlay.place_forget()
 
     def _on_tab_label(self, label: str) -> None:
-        self._show_tab("params" if label == self.t("tab.params") else "report")
+        chosen = "params" if label == self.t("tab.params") else "report"
+        if chosen != self._active_tab:
+            self._show_tab(chosen)
 
     def _show_tab(self, name: str) -> None:
         self._active_tab = name
         if name == "params":
             self.sidebar.grid_remove()
             self._params_panel.grid(row=1, column=0, sticky="nsew")
-            self._tab_switch.set(self.t("tab.params"))
-            return
-        self._params_panel.grid_remove()
-        self.sidebar.grid(row=1, column=0, sticky="nsew")
-        self._tab_switch.set(self.t("tab.report"))
+        else:
+            self._params_panel.grid_remove()
+            self.sidebar.grid(row=1, column=0, sticky="nsew")
+        wanted = self.t("tab.params") if name == "params" else self.t("tab.report")
+        if self._tab_switch.get() != wanted:
+            self._tab_switch.set(wanted)
 
     def _add_absurd_label(self, card: ctk.CTkFrame, row: int) -> None:
         holder = ctk.CTkFrame(card, fg_color="transparent", height=86)
@@ -395,7 +450,7 @@ class Application(ctk.CTk):
             font=ctk.CTkFont(size=28, weight="bold"),
             text_color="#FF0000",
             justify="center",
-            wraplength=340,
+            wraplength=TEXT_WRAP,
         )
         label.place(relx=0.5, rely=0.5, anchor="center")
         self._shake_labels.append(label)
@@ -438,13 +493,17 @@ class Application(ctk.CTk):
         self._clear_sidebar()
         card = ctk.CTkFrame(self.sidebar, corner_radius=24, fg_color=CARD)
         card.grid(row=0, column=0, sticky="ew", padx=8, pady=12)
-        ctk.CTkLabel(
+        card.grid_columnconfigure(0, weight=1)
+        placeholder = ctk.CTkLabel(
             card,
             text=self.t("sidebar.placeholder"),
             justify="left",
+            anchor="w",
+            wraplength=TEXT_WRAP,
             font=ctk.CTkFont(size=16),
             text_color=MUTED,
-        ).grid(row=0, column=0, sticky="w", padx=22, pady=28)
+        )
+        placeholder.grid(row=0, column=0, sticky="ew", padx=22, pady=28)
 
     def open_file(self) -> None:
         path = filedialog.askopenfilename(title=self.t("dialog.open"), filetypes=self._file_types())
@@ -505,13 +564,15 @@ class Application(ctk.CTk):
         self._clear_sidebar()
         card = ctk.CTkFrame(self.sidebar, corner_radius=24, fg_color=SEVERITY_CARD[CRITICAL])
         card.grid(row=0, column=0, sticky="ew", padx=8, pady=12)
-        ctk.CTkLabel(
+        card.grid_columnconfigure(0, weight=1)
+        fail = ctk.CTkLabel(
             card,
             text=self.t("sidebar.open_failed", error=self._error_text(error)),
             justify="left",
-            wraplength=320,
+            wraplength=TEXT_WRAP,
             text_color=PAPER,
-        ).grid(row=0, column=0, sticky="w", padx=20, pady=22)
+        )
+        fail.grid(row=0, column=0, sticky="ew", padx=20, pady=22)
         self.status.configure(text=self.t("status.error"))
 
     def _render_report(self, report: AnalysisReport) -> None:
@@ -533,11 +594,12 @@ class Application(ctk.CTk):
             head,
             text=self.t(report.grade),
             anchor="w",
-            wraplength=300,
+            justify="left",
+            wraplength=TEXT_WRAP,
             text_color=PAPER,
             font=ctk.CTkFont(size=13, weight="bold"),
         )
-        badge.grid(row=1, column=0, sticky="w", padx=20, pady=(4, 6))
+        badge.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 6))
         bar = ctk.CTkProgressBar(head, height=8, progress_color=PAPER, fg_color=score_track_color(report.score))
         bar.set(report.score / 100.0)
         bar.grid(row=2, column=0, sticky="ew", padx=20, pady=(4, 18))
@@ -565,9 +627,67 @@ class Application(ctk.CTk):
         )
         meta = ctk.CTkFrame(self.sidebar, corner_radius=24, fg_color=CARD)
         meta.grid(row=row, column=0, sticky="ew", padx=8, pady=6)
-        ctk.CTkLabel(meta, text=summary, justify="left", anchor="w", text_color=(INK, PAPER)).grid(
-            row=0, column=0, sticky="ew", padx=18, pady=16
+        meta.grid_columnconfigure(0, weight=1)
+        meta_label = ctk.CTkLabel(
+            meta, text=summary, justify="left", anchor="w", wraplength=TEXT_WRAP, text_color=(INK, PAPER)
         )
+        meta_label.grid(row=0, column=0, sticky="ew", padx=18, pady=16)
+        row += 1
+
+        optimize = ctk.CTkFrame(self.sidebar, corner_radius=24, fg_color=CARD)
+        optimize.grid(row=row, column=0, sticky="ew", padx=8, pady=6)
+        optimize.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            optimize,
+            text=self.t("report.optimize.title"),
+            font=ctk.CTkFont(size=16, weight="bold"),
+            anchor="w",
+            text_color=(INK, PAPER),
+        ).grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 6))
+        removable = int(stats.get("faces_removable", 0))
+        faces_text = (
+            self.t(
+                "report.optimize.faces",
+                faces=removable,
+                percent=stats.get("optimize_percent", 0),
+                keep=stats.get("faces_after", stats["faces"]),
+            )
+            if removable
+            else self.t("report.optimize.faces.none")
+        )
+        size_now = int(stats.get("size_bytes") or round(float(stats.get("size_mb", 0)) * 1024 * 1024))
+        size_after = int(stats.get("size_after_bytes", size_now))
+        size_saved = int(stats.get("size_saved_bytes", 0))
+        faces_label = ctk.CTkLabel(
+            optimize, text=faces_text, justify="left", anchor="w", wraplength=TEXT_WRAP, text_color=(INK, PAPER)
+        )
+        faces_label.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 4))
+        size_label = ctk.CTkLabel(
+            optimize,
+            text=self.t(
+                "report.optimize.size",
+                size=format_bytes(self.t, size_now),
+                after=format_bytes(self.t, size_after),
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=TEXT_WRAP,
+            text_color=(INK, PAPER),
+        )
+        size_label.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 4))
+        saved_text = (
+            self.t(
+                "report.optimize.saved",
+                saved=format_bytes(self.t, size_saved),
+                percent=stats.get("size_saved_percent", 0),
+            )
+            if size_saved
+            else self.t("report.optimize.saved.none")
+        )
+        saved_label = ctk.CTkLabel(
+            optimize, text=saved_text, justify="left", anchor="w", wraplength=TEXT_WRAP, text_color=(INK, PAPER)
+        )
+        saved_label.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 16))
         row += 1
 
         for check in report.checks:
@@ -577,13 +697,16 @@ class Application(ctk.CTk):
             card = ctk.CTkFrame(self.sidebar, corner_radius=24, fg_color=fill)
             card.grid(row=row, column=0, sticky="ew", padx=8, pady=6)
             card.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(
+            title = ctk.CTkLabel(
                 card,
                 text=self.t(check.title),
                 font=ctk.CTkFont(size=16, weight="bold"),
                 anchor="w",
+                justify="left",
+                wraplength=TEXT_WRAP,
                 text_color=title_color,
-            ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 0))
+            )
+            title.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 0))
             ctk.CTkLabel(
                 card,
                 text=f"{self.t(f'severity.{check.severity}')} · −{check.penalty:.1f}",
@@ -591,26 +714,28 @@ class Application(ctk.CTk):
                 anchor="w",
                 font=ctk.CTkFont(size=13, weight="bold"),
             ).grid(row=1, column=0, sticky="w", padx=16, pady=(2, 0))
-            ctk.CTkLabel(
+            summary_label = ctk.CTkLabel(
                 card,
                 text=self.t(check.summary),
                 anchor="w",
                 justify="left",
-                wraplength=320,
+                wraplength=TEXT_WRAP,
                 text_color=title_color,
-            ).grid(row=2, column=0, sticky="w", padx=16, pady=(6, 0))
+            )
+            summary_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(6, 0))
             for index, hint in enumerate(check.hints, start=3):
                 if isinstance(hint, Message) and hint.key == "check.polygons.hint.absurd":
                     self._add_absurd_label(card, index)
                     continue
-                ctk.CTkLabel(
+                hint_label = ctk.CTkLabel(
                     card,
                     text=f"• {self.t(hint)}",
                     anchor="w",
                     justify="left",
-                    wraplength=320,
+                    wraplength=TEXT_WRAP,
                     text_color=body_color,
-                ).grid(row=index, column=0, sticky="w", padx=16, pady=(4, 0))
+                )
+                hint_label.grid(row=index, column=0, sticky="ew", padx=16, pady=(4, 0))
             ctk.CTkLabel(card, text="").grid(row=99, column=0, pady=4)
             row += 1
 
@@ -648,23 +773,41 @@ class Application(ctk.CTk):
     def _persist(self) -> None:
         save_settings(self.settings)
 
+    def _schedule_persist(self) -> None:
+        if self._persist_job is not None:
+            self.after_cancel(self._persist_job)
+        self._persist_job = self.after(400, self._flush_persist)
+
+    def _flush_persist(self) -> None:
+        self._persist_job = None
+        self._persist()
+
     def _on_language(self, name: str) -> None:
         reverse = {title: code for code, title in LANGUAGE_NAMES.items()}
         self.settings["language"] = reverse.get(name, FALLBACK)
         self.t.set_language(str(self.settings["language"]))
-        self._persist()
+        self._schedule_persist()
         self._relocalize()
 
     def _on_theme_label(self, label: str) -> None:
         self._apply_theme("light" if label == self.t("settings.theme.light") else "dark")
 
     def _apply_theme(self, theme: str) -> None:
-        self.settings["theme"] = theme if theme in THEMES else "dark"
-        ctk.set_appearance_mode(str(self.settings["theme"]))
-        self.configure(fg_color=(CANVAS_COLORS["light"], CANVAS_COLORS["dark"]))
-        self._canvas_holder.configure(fg_color=CANVAS_COLORS[str(self.settings["theme"])])
+        chosen = theme if theme in THEMES else "dark"
+        if chosen == self.settings.get("theme"):
+            return
+        self.settings["theme"] = chosen
+        self.after(1, lambda: self._commit_theme(chosen))
+
+    def _commit_theme(self, chosen: str) -> None:
+        if str(self.settings.get("theme")) != chosen:
+            return
+        ctk.set_appearance_mode(chosen)
+        self.after_idle(self._finish_theme)
+
+    def _finish_theme(self) -> None:
         self.viewer.set_theme(str(self.settings["theme"]))
-        self._persist()
+        self._schedule_persist()
 
     def _on_xray_switch(self) -> None:
         state = bool(self._settings_xray.get())

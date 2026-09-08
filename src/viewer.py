@@ -11,14 +11,14 @@ from pyopengltk import OpenGLFrame
 
 THEMES: dict[str, dict[str, tuple[float, ...]]] = {
     "dark": {
-        "background": (0.10, 0.12, 0.15, 1.0),
+        "background": (0.039, 0.051, 0.071, 1.0),
         "base": (0.59, 0.67, 0.77),
-        "wire": (0.23, 0.27, 0.35),
-        "ambient": (0.22, 0.24, 0.28, 1.0),
+        "wire": (0.18, 0.22, 0.28),
+        "ambient": (0.16, 0.18, 0.22, 1.0),
     },
     "light": {
-        "background": (0.91, 0.93, 0.95, 1.0),
-        "base": (0.42, 0.51, 0.64),
+        "background": (0.722, 0.761, 0.816, 1.0),
+        "base": (0.59, 0.67, 0.77),
         "wire": (0.38, 0.51, 0.73),
         "ambient": (0.42, 0.46, 0.52, 1.0),
     },
@@ -136,8 +136,10 @@ class MeshViewer(OpenGLFrame):
         self.refresh()
 
     def set_theme(self, theme: str) -> None:
+        previous = self.theme
         self.theme = theme if theme in THEMES else "dark"
-        self._rebuild_colors()
+        if THEMES[self.theme]["base"] != THEMES[previous]["base"]:
+            self._rebuild_colors()
         self.refresh()
 
     def refresh(self) -> None:

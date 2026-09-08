@@ -59,6 +59,30 @@ STRINGS: dict[str, dict[str, str]] = {
     "report.dimensions": {"ru": "Габариты: {value}", "en": "Size: {value}"},
     "report.layers": {"ru": "Подсветка на модели", "en": "Highlight on model"},
     "report.no_defects": {"ru": "Дефектов не найдено", "en": "No defects found"},
+    "report.optimize.title": {"ru": "Потенциал оптимизации", "en": "Optimization potential"},
+    "report.optimize.faces": {
+        "ru": "Можно убрать ~{faces} полигонов ({percent}%) — останется ~{keep}",
+        "en": "Can drop ~{faces} polygons ({percent}%) — about {keep} left",
+    },
+    "report.optimize.faces.none": {
+        "ru": "Заметного запаса по полигонам нет — сетка уже довольно лёгкая",
+        "en": "No meaningful polygon reduction — the mesh is already lean",
+    },
+    "report.optimize.size": {
+        "ru": "Файл сейчас: {size}\nПосле упрощения: ~{after}",
+        "en": "File now: {size}\nAfter simplification: ~{after}",
+    },
+    "report.optimize.saved": {
+        "ru": "Экономия веса: ~{saved} ({percent}%)",
+        "en": "Size savings: ~{saved} ({percent}%)",
+    },
+    "report.optimize.saved.none": {
+        "ru": "Экономия веса: нет",
+        "en": "Size savings: none",
+    },
+    "size.bytes": {"ru": "{value} Б", "en": "{value} B"},
+    "size.kb": {"ru": "{value} КБ", "en": "{value} KB"},
+    "size.mb": {"ru": "{value} МБ", "en": "{value} MB"},
     "yes": {"ru": "да", "en": "yes"},
     "no": {"ru": "нет", "en": "no"},
     "severity.ok": {"ru": "норма", "en": "fine"},
