@@ -63,21 +63,7 @@ Controls: LMB rotate · RMB or Shift+LMB pan · wheel zoom · double-click reset
 
 ## Run it
 
-**Windows build** — launch `3DCheck.exe` in the repo root.
-
-**From source**
-
-```bat
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-run.bat
-```
-
-Or:
-
-```bat
-.venv\Scripts\python src\app.py
-```
+**Windows build** — launch `3DCheck.exe` or `run` in the repo root.
 
 Pass a file path as an argument to open it on startup.
 
